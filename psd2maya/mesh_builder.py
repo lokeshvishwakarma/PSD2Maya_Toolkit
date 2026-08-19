@@ -82,7 +82,7 @@ def _uv_affine(
     page_h: int,
     pixels_per_unit: float,
 ):
-    """Collapse `_pixel_to_local_and_uv`'s mapping into (u0, su, v0, sv).
+    """Collapse `_pixel_to_local_and_uv`'s mapping into (a, b, c, d, e, f).
 
     Substituting the local->pixel inverse (px = local_x*ppu + W/2,
     py = -local_y*ppu + H/2) into the UV formula makes both coordinates
@@ -91,14 +91,20 @@ def _uv_affine(
         u = (atlas_x + atlas_w/2)/page_w     + (atlas_w*ppu)/(W*page_w) * local_x
         v = 1 - (atlas_y + atlas_h/2)/page_h + (atlas_h*ppu)/(H*page_h) * local_y
 
-    The layer's bbox center maps to the center of its atlas rect, and the
-    scale terms convert one Maya unit into a fraction of the atlas page.
+    i.e. u = a*local_x + b*local_y + c with b=0, and v = d*local_x + e*local_y + f
+    with d=0 -- the initial build never rotates a shell, so only the diagonal
+    terms are nonzero here. The general 6-parameter form exists so that
+    `relayout.rebuild_textures_from_uv_layout` can later overwrite this with a
+    mapping that *does* have nonzero b/d, once a manual Layout UV pass has
+    rotated the shell. The layer's bbox center maps to the center of its atlas
+    rect, and the scale terms convert one Maya unit into a fraction of the
+    atlas page.
     """
     u0 = (placement.atlas_x + placement.atlas_w / 2.0) / page_w
     su = (placement.atlas_w * pixels_per_unit) / (layer.width * page_w)
     v0 = 1.0 - (placement.atlas_y + placement.atlas_h / 2.0) / page_h
     sv = (placement.atlas_h * pixels_per_unit) / (layer.height * page_h)
-    return (u0, su, v0, sv)
+    return (su, 0.0, u0, 0.0, sv, v0)
 
 
 def _signed_z(vertices, a, b, c) -> float:

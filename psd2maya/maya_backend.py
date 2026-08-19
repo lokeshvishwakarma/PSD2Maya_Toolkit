@@ -26,14 +26,34 @@ mesh (a world-space raycast projection, which introduces error and jagged
 UV borders wherever the new topology crosses a seam).
 
 This module doesn't need that. Each LayerMesh carries `uv_affine`, the
-closed-form `(u, v) = (u0 + su*x, v0 + sv*y)` mapping from local position to
-atlas UV (exact because the mesh is planar and the pixel->atlas mapping is
-affine -- see mesh_builder._uv_affine). `reproject_uvs` evaluates it for
-whatever vertices exist *now*, so UVs come back exact at any topology with
-no projection error, no seam cleanup, and no source mesh to keep around.
-The mapping is stored on the transform as locked `psdUv*` attributes, so
-reprojection also works later, after any further remeshing the user does by
-hand.
+closed-form `(u, v) = (a*x + b*y + c, d*x + e*y + f)` mapping from local
+position to atlas UV (exact because the mesh is planar and the pixel->atlas
+mapping is affine -- see mesh_builder._uv_affine). `reproject_uvs` evaluates
+it for whatever vertices exist *now*, so UVs come back exact at any topology
+with no projection error, no seam cleanup, and no source mesh to keep
+around. The mapping is stored on the transform as locked `psdUv*`
+attributes, so reprojection also works later, after any further remeshing
+the user does by hand. The full 6-parameter (rather than a simpler diagonal
+u=f(x), v=f(y)) form is what lets the same mechanism also represent a UV
+shell that's been rotated -- see `relayout.py`'s texture-rebake feature for
+manually re-laid-out UVs, which relies on that.
+
+UV sets per atlas page
+-----------------------
+A mesh created via `MFnMesh.create()` gets a single UV set with Maya's
+generic default name ("map1"), regardless of which atlas page it actually
+samples. That's fine while everything fits on one page, but once a PSD's
+layers spill across several atlas pages (`atlas_packer.py`'s `--max-page-
+size` limit), every mesh's UV set having the same generic name gives no
+indication -- in the Outliner, UV Editor, or Attribute Editor's texture
+list -- of which of the several differently-textured pages any given mesh
+actually belongs to. `_sort_into_uv_set` renames each mesh's (single) UV
+set to `atlasPage{N}`, matching the existing `atlasFile{N}`/`atlasShader{N}`/
+`atlasSG{N}` naming, and explicitly links that page's file texture to it via
+`cmds.uvLink` -- so the mesh-to-UV-set-to-texture association is a queryable
+fact (`cmds.uvLink(query=True, texture=file_node)`) rather than something
+that only works by accident because there's currently just one UV set to
+be "current".
 """
 
 from __future__ import annotations
@@ -45,7 +65,7 @@ from .scene_model import LayerMesh, SceneData
 
 logger = logging.getLogger(__name__)
 
-_UV_ATTRS = ("psdUvU0", "psdUvScaleU", "psdUvV0", "psdUvScaleV")
+_UV_ATTRS = ("psdUvA", "psdUvB", "psdUvC", "psdUvD", "psdUvE", "psdUvF")
 
 
 def _create_mesh_transform(mesh: LayerMesh):
@@ -76,12 +96,21 @@ def _create_mesh_transform(mesh: LayerMesh):
 
 
 def _tag_uv_affine(transform: str, uv_affine) -> None:
-    """Store the local->UV affine mapping on `transform` as locked scalar attrs."""
+    """Store the local->UV affine mapping on `transform` as locked scalar attrs.
+
+    Also used to *overwrite* an already-tagged mesh (see
+    `relayout.rebuild_textures_from_uv_layout`), so an existing attribute is
+    explicitly unlocked before its value is changed and relocked after --
+    `setAttr(..., lock=True)` sets the lock state but does not, by itself,
+    grant permission to change a value that's already locked.
+    """
     import maya.cmds as cmds  # noqa: PLC0415
 
     for attr, value in zip(_UV_ATTRS, uv_affine):
         if not cmds.attributeQuery(attr, node=transform, exists=True):
             cmds.addAttr(transform, longName=attr, attributeType="double", keyable=False)
+        else:
+            cmds.setAttr(f"{transform}.{attr}", lock=False)
         cmds.setAttr(f"{transform}.{attr}", value, lock=True)
 
 
@@ -111,7 +140,7 @@ def reproject_uvs(transform: str, uv_affine=None) -> int:
                 f"{transform!r} has no psdUv* attributes; it wasn't built by psd2maya "
                 "(or was rebuilt without them), so its UVs can't be reprojected."
             )
-    u0, su, v0, sv = uv_affine
+    a, b, c, d, e, f = uv_affine
 
     sel = om2.MSelectionList()
     sel.add(transform)
@@ -122,8 +151,8 @@ def reproject_uvs(transform: str, uv_affine=None) -> int:
     # Local (object) space: uv_affine is defined against the mesh's own local
     # coordinates, which is what makes it survive the transform being moved.
     points = fn_mesh.getPoints(om2.MSpace.kObject)
-    u_array = om2.MFloatArray([u0 + su * points[i].x for i in range(len(points))])
-    v_array = om2.MFloatArray([v0 + sv * points[i].y for i in range(len(points))])
+    u_array = om2.MFloatArray([a * p.x + b * p.y + c for p in points])
+    v_array = om2.MFloatArray([d * p.x + e * p.y + f for p in points])
 
     face_counts, face_verts = [], []
     for face_index in range(fn_mesh.numPolygons):
@@ -154,6 +183,28 @@ def retopologize(transform: str, target_face_count: int = 200, uv_affine=None) -
     reproject_uvs(transform, uv_affine=uv_affine)
 
 
+def _uv_set_name_for_page(page_index: int) -> str:
+    return f"atlasPage{page_index}"
+
+
+def _sort_into_uv_set(shape: str, uv_set_name: str, file_node: str) -> None:
+    """Rename `shape`'s current UV set to `uv_set_name` and link `file_node` to it.
+
+    Queries the *current* UV set rather than assuming it's still named
+    "map1" -- if `retopo=True` ran first, whatever `polyRetopo` left as the
+    live UV set (its data was already overwritten by `reproject_uvs`; only
+    the set's own name is in question here) is what gets renamed, so this
+    works identically whether it runs right after `_create_mesh_transform`
+    or after a full retopo pass.
+    """
+    import maya.cmds as cmds  # noqa: PLC0415
+
+    current = cmds.polyUVSet(shape, query=True, currentUVSet=True)[0]
+    if current != uv_set_name:
+        cmds.polyUVSet(shape, rename=True, uvSet=current, newUVSet=uv_set_name)
+    cmds.uvLink(make=True, uvSet=f"{shape}.uvSet[0].uvSetName", texture=file_node)
+
+
 def build_in_maya(
     scene: SceneData,
     atlas_texture_paths: Dict[int, str],
@@ -175,6 +226,7 @@ def build_in_maya(
     root = cmds.group(empty=True, name=root_name)
 
     shading_groups = {}
+    file_nodes = {}
     for page in scene.atlas_pages:
         tex_path = atlas_texture_paths[page.index]
         file_node = cmds.shadingNode("file", asTexture=True, isColorManaged=True, name=f"atlasFile{page.index}")
@@ -192,6 +244,7 @@ def build_in_maya(
         sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=f"atlasSG{page.index}")
         cmds.connectAttr(f"{shader}.outColor", f"{sg}.surfaceShader", force=True)
         shading_groups[page.index] = sg
+        file_nodes[page.index] = file_node
 
     for mesh in scene.meshes:
         transform_obj = _create_mesh_transform(mesh)
@@ -223,6 +276,7 @@ def build_in_maya(
 
         shape = cmds.listRelatives(mesh.maya_name, shapes=True, fullPath=True)[0]
         cmds.sets(shape, edit=True, forceElement=shading_groups[mesh.atlas_page])
+        _sort_into_uv_set(shape, _uv_set_name_for_page(mesh.atlas_page), file_nodes[mesh.atlas_page])
 
     return root
 

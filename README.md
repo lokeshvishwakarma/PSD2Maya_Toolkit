@@ -103,8 +103,8 @@ dataclasses are the only thing they share.
   of the original -- a world-space raycast projection that introduces error
   and leaves jagged UV borders where the new topology crosses a seam. This
   package doesn't need that: because each mesh is planar and the
-  pixel->atlas mapping is affine, the whole mapping collapses to four
-  numbers, `(u, v) = (u0 + su*x, v0 + sv*y)` (see
+  pixel->atlas mapping is affine, the whole mapping collapses to six
+  numbers, `(u, v) = (a*x + b*y + c, d*x + e*y + f)` (see
   `mesh_builder._uv_affine`). `maya_backend.reproject_uvs` evaluates that
   per vertex, so UVs come back **exact at any topology** with no source
   mesh, no projection, and no seam repair. The mapping is also stored on
@@ -136,6 +136,49 @@ dataclasses are the only thing they share.
   instead of one material per layer. Each layer gets a bleed-extended
   padding border so bilinear filtering doesn't smear a neighboring
   layer's pixels across the seam.
+- **UVs sorted into a named UV set per atlas page.** A mesh built via
+  `MFnMesh.create()` gets one UV set with Maya's generic default name
+  ("map1") no matter which atlas page it samples -- fine with a single
+  page, but once layers spill across several, every mesh's UV set having
+  the same generic name gives no indication, in the Outliner/UV
+  Editor/Attribute Editor, of which page/texture any given mesh actually
+  belongs to. `maya_backend._sort_into_uv_set` renames each mesh's UV set
+  to `atlasPage{N}` (matching the existing `atlasFile{N}`/`atlasShader{N}`/
+  `atlasSG{N}` naming) and explicitly links that page's file texture to it
+  via `cmds.uvLink`, so the mesh -> UV set -> texture chain is a queryable
+  fact (`cmds.uvLink(query=True, texture=file_node)`) instead of relying
+  on "whichever UV set happens to be current". Runs automatically for
+  every mesh regardless of page count or whether `retopo=True` ran first
+  (it queries the *current* UV set rather than assuming it's still named
+  "map1", so it's agnostic to whatever `polyRetopo` left behind).
+- **Manual texture rebake after a Layout UV pass, per UV set, exact.**
+  This package's own atlas packing just places each layer's full
+  bounding-box rectangle side by side -- fine for background art, wasteful
+  for irregular traced silhouettes. `relayout.rebuild_textures_from_uv_layout`
+  (the "Rebuild Texture from UV Layout" button) lets you improve on that by
+  hand: select some of the rig's meshes, run Maya's native Layout UV to
+  repack their actual UV shells more tightly, then click the button. It
+  recomposites each affected layer fresh from the source `.psd` and warps
+  it into wherever Layout UV now says it belongs, per UV set independently
+  (a set with shells from more than one page rebakes each page separately,
+  it doesn't merge them into one new shared image). This is a *manual*
+  step, not a callback triggered by running Layout UV -- Maya's Layout UV
+  has no cross-version "after" hook to attach to, and an explicit click is
+  more predictable than a background command watcher. It works because
+  Layout UV repositions/rescales/rotates a shell as a whole without
+  distorting it internally, so the mapping from a mesh's local vertex
+  positions to its post-layout UVs is *exactly* one 2D affine transform
+  (verified: fitting it back against Maya's own `polyMultiLayoutUV` output
+  gives a residual of `0.0` at float64 precision) -- composed with the
+  fixed local-position-to-source-pixel mapping, that's what PIL uses to
+  warp each recomposited layer directly into its new spot. Each rebaked
+  mesh's locked `psdUv*` attributes are also overwritten with the new
+  affine, so a later `reproject_uvs`/`retopologize` call stays consistent
+  with the new layout instead of silently reverting to the pre-layout one.
+  Tradeoffs: assumes the PSD's layers haven't moved/resized since the rig
+  was built (the original local<->pixel mapping isn't re-derived), and
+  rebaked shells get no bleed-padding border the way the original atlas
+  packing gives them.
 - **Hidden layers, empty layers, and groups are skipped**, not
   recreated as empty meshes. Text/shape/smart-object layers are
   rasterized via `layer.composite()` like everything else -- there's no
@@ -271,6 +314,15 @@ To re-derive UVs yourself after remeshing a layer by hand:
 ```python
 from psd2maya.maya_backend import reproject_uvs
 reproject_uvs("Sky")   # reads the locked psdUv* attrs on the transform
+```
+
+After running Maya's own Layout UV on some of the rig's meshes (see the
+"Manual texture rebake" design note above), click **Rebuild Texture from
+UV Layout** in the UI, or call it directly:
+
+```python
+from psd2maya.relayout import rebuild_textures_from_uv_layout
+rebuild_textures_from_uv_layout(scene)   # the SceneData from run_pipeline/build_in_maya
 ```
 
 ## Testing
