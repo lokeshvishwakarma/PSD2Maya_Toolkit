@@ -25,6 +25,7 @@ from shiboken6 import wrapInstance
 from .layer_tree import LayerNode, read_layer_tree
 from .maya_backend import build_in_maya
 from .pipeline import run_pipeline
+from .relayout import rebuild_textures_from_uv_layout
 
 WINDOW_OBJECT_NAME = "psd2mayaBuildWindow"
 
@@ -96,6 +97,7 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
 
         self._canvas_size = None  # (width, height) of the currently loaded PSD
+        self._last_scene = None  # SceneData from the most recent successful Build Mesh
 
         self._build_ui()
         self._connect_signals()
@@ -175,12 +177,22 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.build_btn.setMinimumHeight(32)
         layout.addWidget(self.build_btn)
 
+        self.rebuild_texture_btn = QtWidgets.QPushButton("Rebuild Texture from UV Layout", self)
+        self.rebuild_texture_btn.setEnabled(False)
+        self.rebuild_texture_btn.setToolTip(
+            "After manually running Maya's Layout UV on some of this rig's meshes, "
+            "click this to rebake each affected UV set's atlas texture to match the "
+            "new UV positions and repoint its file texture node at the result."
+        )
+        layout.addWidget(self.rebuild_texture_btn)
+
     def _connect_signals(self):
         self.browse_btn.clicked.connect(self._on_browse)
         self.retopo_chk.toggled.connect(self.target_face_count_spin.setEnabled)
         self.path_edit.fileDropped.connect(self._load_psd)
         self.path_edit.returnPressed.connect(lambda: self._load_psd(self.path_edit.text().strip()))
         self.build_btn.clicked.connect(self._on_build_mesh)
+        self.rebuild_texture_btn.clicked.connect(self._on_rebuild_texture)
 
     # -- PSD loading / tree population -----------------------------------
 
@@ -285,6 +297,9 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             QtWidgets.QApplication.restoreOverrideCursor()
             self.build_btn.setEnabled(True)
 
+        self._last_scene = scene
+        self.rebuild_texture_btn.setEnabled(True)
+
         total_faces = sum(cmds.polyEvaluate(m.maya_name, face=True) for m in scene.meshes)
         topo = "polyRetopo" if self.retopo_chk.isChecked() else "traced quads"
         note = ""
@@ -300,6 +315,32 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             f"Built {len(scene.meshes)} mesh(es), {total_faces} faces ({topo}) under '{root}'. "
             f"Atlas: {', '.join(atlas_paths.values())}.{note}"
         )
+
+    def _on_rebuild_texture(self):
+        if self._last_scene is None:
+            self._set_status("Build Mesh first -- nothing to rebake yet.", error=True)
+            return
+
+        self.rebuild_texture_btn.setEnabled(False)
+        self._set_status("Rebaking texture(s) from current UV layout...")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        cmds.waitCursor(state=True)
+        try:
+            new_paths = rebuild_textures_from_uv_layout(self._last_scene)
+        except Exception as exc:
+            traceback.print_exc()
+            self._set_status(f"Texture rebake failed: {exc}", error=True)
+            QtWidgets.QMessageBox.critical(self, "Rebuild Texture Failed", str(exc))
+            return
+        finally:
+            cmds.waitCursor(state=False)
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.rebuild_texture_btn.setEnabled(True)
+
+        if not new_paths:
+            self._set_status("No UV sets had any rebakeable meshes -- nothing was changed.", error=True)
+            return
+        self._set_status(f"Rebaked {len(new_paths)} atlas page(s): {', '.join(new_paths.values())}")
 
     def _set_status(self, text: str, error: bool = False):
         color = "#ff6b6b" if error else "#9fd39f"
