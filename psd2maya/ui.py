@@ -141,10 +141,29 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.detail_level_spin.setSingleStep(0.5)
         self.detail_level_spin.setValue(2.0)
 
+        self.retopo_chk = QtWidgets.QCheckBox("Use Maya polyRetopo", options_group)
+        self.retopo_chk.setToolTip(
+            "Remesh each layer with Maya's polyRetopo for more uniform quad flow "
+            "instead of the built-in ear-clip topology.\n"
+            "UVs are recomputed exactly afterward, so the texture is unaffected."
+        )
+
+        self.target_face_count_spin = QtWidgets.QSpinBox(options_group)
+        self.target_face_count_spin.setRange(4, 100000)
+        self.target_face_count_spin.setSingleStep(50)
+        self.target_face_count_spin.setValue(200)
+        self.target_face_count_spin.setEnabled(False)
+        self.target_face_count_spin.setToolTip(
+            "Approximate quad count polyRetopo aims for, per mesh. Applied to every "
+            "layer alike, so large background layers get the same budget as small props."
+        )
+
         opt_form.addRow(self.include_hidden_chk)
         opt_form.addRow("Pixels per Maya unit:", self.pixels_per_unit_spin)
         opt_form.addRow("Depth step (Z per layer):", self.depth_step_spin)
         opt_form.addRow("Trace detail (lower = tighter):", self.detail_level_spin)
+        opt_form.addRow(self.retopo_chk)
+        opt_form.addRow("Target faces per mesh:", self.target_face_count_spin)
         layout.addWidget(options_group)
 
         self.status_label = QtWidgets.QLabel("", self)
@@ -158,6 +177,7 @@ class Psd2MayaWindow(QtWidgets.QDialog):
 
     def _connect_signals(self):
         self.browse_btn.clicked.connect(self._on_browse)
+        self.retopo_chk.toggled.connect(self.target_face_count_spin.setEnabled)
         self.path_edit.fileDropped.connect(self._load_psd)
         self.path_edit.returnPressed.connect(lambda: self._load_psd(self.path_edit.text().strip()))
         self.build_btn.clicked.connect(self._on_build_mesh)
@@ -176,13 +196,19 @@ class Psd2MayaWindow(QtWidgets.QDialog):
     def _load_psd(self, path: str):
         if not path:
             return
-        if not os.path.isfile(path):
-            self._set_status(f"File not found: {path}", error=True)
-            return
 
+        # Invalidate before validating: a failed load must not leave the
+        # previous file's layer tree on screen with Build still live, or the
+        # user would be looking at one PSD's layers while the path field
+        # points at another.
         self.layer_tree.clear()
         self.build_btn.setEnabled(False)
         self._canvas_size = None
+        self.canvas_label.setText("No file loaded.")
+
+        if not os.path.isfile(path):
+            self._set_status(f"File not found: {path}", error=True)
+            return
 
         try:
             nodes, canvas_w, canvas_h = read_layer_tree(path)
@@ -240,7 +266,14 @@ class Psd2MayaWindow(QtWidgets.QDialog):
                 detail_level=self.detail_level_spin.value(),
                 include_hidden=self.include_hidden_chk.isChecked(),
             )
-            root = build_in_maya(scene, atlas_paths)
+            retopo_failures = []
+            root = build_in_maya(
+                scene,
+                atlas_paths,
+                retopo=self.retopo_chk.isChecked(),
+                target_face_count=self.target_face_count_spin.value(),
+                retopo_failures=retopo_failures,
+            )
             cmds.select(root, replace=True)
         except Exception as exc:
             traceback.print_exc()
@@ -252,9 +285,20 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             QtWidgets.QApplication.restoreOverrideCursor()
             self.build_btn.setEnabled(True)
 
+        total_faces = sum(cmds.polyEvaluate(m.maya_name, face=True) for m in scene.meshes)
+        topo = "polyRetopo" if self.retopo_chk.isChecked() else "traced quads"
+        note = ""
+        if retopo_failures:
+            # Never let this pass silently: the fallback topology is also
+            # all-quads, so nothing else on screen would reveal it.
+            note = (
+                f" NOTE: polyRetopo could not process {len(retopo_failures)} mesh(es) "
+                f"({', '.join(retopo_failures[:3])}{'...' if len(retopo_failures) > 3 else ''}); "
+                "those kept their original traced topology."
+            )
         self._set_status(
-            f"Built {len(scene.meshes)} mesh(es) under '{root}'. "
-            f"Atlas: {', '.join(atlas_paths.values())}"
+            f"Built {len(scene.meshes)} mesh(es), {total_faces} faces ({topo}) under '{root}'. "
+            f"Atlas: {', '.join(atlas_paths.values())}.{note}"
         )
 
     def _set_status(self, text: str, error: bool = False):
