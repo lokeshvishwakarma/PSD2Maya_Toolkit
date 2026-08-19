@@ -75,6 +75,32 @@ def _pixel_to_local_and_uv(
     return (local_x, local_y, 0.0), (u, v)
 
 
+def _uv_affine(
+    layer: SourceLayer,
+    placement: PackedLayer,
+    page_w: int,
+    page_h: int,
+    pixels_per_unit: float,
+):
+    """Collapse `_pixel_to_local_and_uv`'s mapping into (u0, su, v0, sv).
+
+    Substituting the local->pixel inverse (px = local_x*ppu + W/2,
+    py = -local_y*ppu + H/2) into the UV formula makes both coordinates
+    affine in local space:
+
+        u = (atlas_x + atlas_w/2)/page_w     + (atlas_w*ppu)/(W*page_w) * local_x
+        v = 1 - (atlas_y + atlas_h/2)/page_h + (atlas_h*ppu)/(H*page_h) * local_y
+
+    The layer's bbox center maps to the center of its atlas rect, and the
+    scale terms convert one Maya unit into a fraction of the atlas page.
+    """
+    u0 = (placement.atlas_x + placement.atlas_w / 2.0) / page_w
+    su = (placement.atlas_w * pixels_per_unit) / (layer.width * page_w)
+    v0 = 1.0 - (placement.atlas_y + placement.atlas_h / 2.0) / page_h
+    sv = (placement.atlas_h * pixels_per_unit) / (layer.height * page_h)
+    return (u0, su, v0, sv)
+
+
 def _signed_z(vertices, a, b, c) -> float:
     pa, pb, pc = vertices[a], vertices[b], vertices[c]
     return (pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0])
@@ -172,6 +198,7 @@ def build_scene(
                     vertices=vertices,
                     uvs=uvs,
                     faces=faces,
+                    uv_affine=_uv_affine(layer, placement, page_w, page_h, pixels_per_unit),
                 )
             )
 

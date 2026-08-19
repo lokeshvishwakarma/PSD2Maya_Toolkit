@@ -62,6 +62,22 @@ dataclasses are the only thing they share.
   Tracing uses `RETR_EXTERNAL`, so a literal hole in a layer's art (a
   ring shape) will come back filled solid -- there's no interior-hole
   support.
+- **Self-crossing traced boundaries are repaired before triangulation.**
+  Where the art has a roughly one-pixel-wide neck or spur, `findContours`
+  traces out and back within a pixel of itself, so the contour touches or
+  crosses itself. This is *not* an `approxPolyDP` artifact -- it's in the
+  raw contour too, so lowering `--detail-level` doesn't help (verified: a
+  spur still crosses at epsilon 0). Ear-clipping a self-crossing boundary
+  emits overlapping faces, which makes the surface locally
+  non-orientable: two same-winding faces share a directed edge. Maya
+  reports that as nonmanifold and `polyRetopo` refuses to run
+  ("PolyRetopo does not work on polygonal object with nonmanifold
+  geometry"). `contour_tracer._remove_self_intersections` cuts the ring at
+  each crossing and keeps the larger loop. On the 50-layer production PSD
+  this touched 2 of 68 shells, removing 3 and 2 vertices for an area loss
+  of 0.012% and 0.0007% -- the discarded loops are degenerate slivers, so
+  the visible silhouette is unchanged. Afterwards all 68 shells are simple,
+  no mesh is nonmanifold, and `polyRetopo` succeeds on every one.
 - **Guaranteed-quad remeshing, not `polyTriangulate`+`polyQuad`.** Maya's
   own quadrangulate command is a best-effort merge of adjacent triangle
   pairs and does not guarantee it can pair off every triangle -- for an
@@ -79,6 +95,31 @@ dataclasses are the only thing they share.
   a very tightly-traced (low `--detail-level`) boundary can produce a lot
   of geometry -- raise `--detail-level` to simplify the boundary first if
   that matters.
+- **Optional Maya-native retopology, with exact UVs (not Transfer
+  Attributes).** `build_in_maya(..., retopo=True)` (the "Use Maya
+  polyRetopo" checkbox in the UI) replaces the ear-clip topology with
+  `cmds.polyRetopo`'s more uniform quad flow. Remeshing normally destroys
+  UVs, and the standard fix is `cmds.transferAttributes` from a saved copy
+  of the original -- a world-space raycast projection that introduces error
+  and leaves jagged UV borders where the new topology crosses a seam. This
+  package doesn't need that: because each mesh is planar and the
+  pixel->atlas mapping is affine, the whole mapping collapses to four
+  numbers, `(u, v) = (u0 + su*x, v0 + sv*y)` (see
+  `mesh_builder._uv_affine`). `maya_backend.reproject_uvs` evaluates that
+  per vertex, so UVs come back **exact at any topology** with no source
+  mesh, no projection, and no seam repair. The mapping is also stored on
+  each transform as locked `psdUv*` attributes, so you can call
+  `reproject_uvs("layerName")` yourself after any further hand remeshing.
+  Verified on a real 3840x2139, 50-layer production PSD: 100% quads before
+  and after, UV error at float32 precision (~3e-8), every UV inside 0..1,
+  and the traced silhouette held to under 1% of each mesh's span.
+  Tradeoffs: `polyRetopo` costs roughly 0.5s per mesh (~33s for 68
+  shells), and `targetFaceCount` is applied per mesh, so simple layers get
+  *padded up* to the target -- on that production file a target of 200 took
+  the scene from 9,876 faces to 16,254. Lower the target, or leave the
+  checkbox off, if face count matters more than quad flow. If `polyRetopo`
+  fails on a given shell it's logged and that mesh keeps its original
+  traced topology rather than aborting the build.
 - **One mesh per layer (or per shell), not one shared mesh.** Each
   traced shell becomes its own transform + mesh, parented under a common
   `psd2maya_root` group. This is what makes it a *parallax rig* rather
@@ -122,10 +163,40 @@ hand-written ASCII entirely -- see Usage below.
 
 ## Install
 
+### Standalone (CLI only)
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### For use inside Maya
+
+The `.venv` above is a separate interpreter that Maya never sees -- the
+dependencies have to go into **Maya's own Python** (`mayapy`) instead:
+
+```bash
+"/Applications/Autodesk/maya2026/Maya.app/Contents/bin/mayapy" -m pip install --user psd-tools Pillow "attrs==25.3.0"
+```
+
+(Adjust the path for your Maya version. `numpy` and `opencv-python-headless`
+already ship with Maya 2026.)
+
+`attrs` **must** be pinned to 25.3.0. Maya's bundled `mayaflow` addin ships
+its own `attr` package at that version and wins the import, so a newer
+`attrs` from pip fails at import time with
+`cannot import name 'ClassProps' from 'attr._make'`.
+
+Then make the package importable from Maya. In the Script Editor:
+
+```python
+import sys
+sys.path.append("/path/to/PSD_Maya_Toolkit")
+```
+
+Add that line to `userSetup.py` (in
+`~/Library/Preferences/Autodesk/maya/<version>/scripts/` on macOS) to make it
+stick across restarts, since `sys.path` resets every session.
 
 ## Usage
 
@@ -182,12 +253,25 @@ show()
 ```
 
 Drag a `.psd`/`.psb` file onto the path field (or use Browse...) to
-populate the layer tree -- hidden layers show greyed out. Adjust the
-build options if needed, then click **Build Mesh** to run the full
-parse -> pack -> trace -> quadrangulate -> build pipeline and create the
-rig, textured meshes, and atlas PNG(s) directly in the open scene. Output
-(the atlas PNG(s)) is written to `<psd_dir>/<psd_name>_maya/` next to the
-source file.
+populate the layer tree -- groups nest, hidden layers show greyed out.
+Adjust the build options if needed, then click **Build Mesh** to run the
+full parse -> pack -> trace -> quadrangulate -> build pipeline and create
+the rig, textured meshes, and atlas PNG(s) directly in the open scene.
+Output (the atlas PNG(s)) is written to `<psd_dir>/<psd_name>_maya/` next
+to the source file.
+
+Ticking **Use Maya polyRetopo** remeshes each layer with Maya's
+retopologizer instead of the built-in ear-clip topology and then restores
+exact UVs (see the design note above for the tradeoffs -- it's slower and
+usually *raises* face count). **Target faces per mesh** enables only when
+that box is ticked.
+
+To re-derive UVs yourself after remeshing a layer by hand:
+
+```python
+from psd2maya.maya_backend import reproject_uvs
+reproject_uvs("Sky")   # reads the locked psdUv* attrs on the transform
+```
 
 ## Testing
 

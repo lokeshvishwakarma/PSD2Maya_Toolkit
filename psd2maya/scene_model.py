@@ -75,6 +75,12 @@ class LayerMesh:
     vertices: list  # list[(x, y, z)], local space, z is always 0.0 (planar)
     uvs: list  # list[(u, v)], parallel to `vertices`, in the atlas page's 0..1 space
     faces: list  # list[(v0, v1, v2, v3)], CCW winding, indices into vertices/uvs
+    # Closed-form (u, v) = (u0 + su*local_x, v0 + sv*local_y). Because the mesh is
+    # planar and the pixel->atlas mapping is affine, this reproduces `uvs` exactly
+    # from a vertex's local position alone -- which means UVs can be recomputed for
+    # *any* topology (e.g. after Maya's polyRetopo replaces every vertex) without
+    # projecting or transferring from a source mesh. See maya_backend.reproject_uvs.
+    uv_affine: tuple = (0.0, 0.0, 0.0, 0.0)  # (u0, su, v0, sv)
 
 
 @dataclass
