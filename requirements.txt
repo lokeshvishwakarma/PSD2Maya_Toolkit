@@ -1,0 +1,7 @@
+psd-tools>=1.9
+Pillow>=10.0
+numpy>=1.24
+opencv-python-headless>=4.8
+# PySide6/shiboken6 (needed only by psd2maya/ui.py) are NOT listed here --
+# they ship with Maya 2025+'s own Python interpreter and must not be
+# pip-installed into a separate venv.

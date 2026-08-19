@@ -1,0 +1,41 @@
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+.claude/
+
+# Environment variables and secrets (NEVER commit these)
+.env
+.env.local
+*.env.[pk]
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Node / JavaScript dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# Python compiled files and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env/
+
+# Build directories and logs
+dist/
+build/
+out/
+*.log
