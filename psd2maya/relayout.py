@@ -54,10 +54,70 @@ maya_backend._tag_uv_affine) are overwritten with the newly fitted affine,
 so a later `reproject_uvs`/`retopologize` call reprojects UVs consistent
 with the *new* layout instead of silently reverting to the pre-layout one.
 
+Multiple UV sets: before that overwrite, whatever the mapping looked like
+*before* this rebake is written into a second, preserved UV set on the same
+mesh (`_write_uv_set`, named `<uvSet>_original`, e.g.
+`atlasPage0_original`) -- so nothing about the pre-layout state is lost,
+even though the live/textured UV set (`atlasPage0`) keeps using its own
+data (the post-Layout-UV values you already produced by hand) unchanged.
+This happens automatically, every rebake, for every mesh -- there's no
+toggle to skip it. It's a rolling one-generation snapshot rather than an
+unbounded history: rebaking the same mesh again overwrites `_original`
+with whatever the mapping was one rebake ago, it doesn't pile up
+`_original_2`, `_original_3`, etc. New UV sets are appended after existing
+ones without disturbing an existing set's index or which set is
+"current" (verified against Maya directly), so this never interferes with
+the `uvSet[0]` this module and `maya_backend._sort_into_uv_set` rely on
+for the live, texture-linked set.
+
 Known limitation: unlike `atlas_packer.py`'s original packing, rebaked
 shells get no bleed-padding border, so filtering/mipmapping right at a
 shell's edge can pick up a neighboring shell's pixels (or transparency)
 slightly more readily than the original atlas did.
+
+Superimposing the atlas texture PNGs themselves (`merge_textures`)
+----------------------------------------------------------------------
+A literal thing, not a scene-geometry thing: every atlas page still in
+use has its own PNG file on disk (the original packed atlas, or a
+Layout-UV-rebaked one). `merge_textures` superimposes those PNG files
+directly on top of each other -- the same operation as selecting every
+layer in Photoshop and choosing Merge Layers/Flatten Image, just applied
+to this package's own generated PNGs instead of PSD layers -- into one
+merged PNG, and repoints the existing meshes at it. It creates no new
+mesh and no backdrop card; every mesh that already existed keeps its own
+shape and position, just with its UVs and shading updated to point at the
+one merged texture instead of its own page's.
+
+Each page's PNG is composited at its native resolution, pasted at the
+same (0, 0) origin as every other page (not resized to match one
+another, and not repositioned/packed side by side -- this is a stack, not
+a pack), in ascending page-index order, onto a canvas sized to the
+largest page's dimensions. A page smaller than that canvas simply doesn't
+cover the rest of it (left transparent), rather than being stretched to
+fill it.
+
+Because pages aren't resized, a mesh's UV mapping only needs a *scale* (no
+translation, since every page shares the same (0, 0) origin in the merged
+canvas) to stay correct: `new_u = (page.width/merged_w) * u`, `new_v` the
+analogous per-page-height scale composed with the existing v-flip
+convention -- composed directly with the mesh's existing `psdUv*` affine,
+with no per-vertex fitting needed. Same rolling-snapshot behavior as the
+Layout UV rebake: each mesh's pre-merge mapping is preserved as another UV
+set (`<uvSet>_premerge`) before being overwritten. Every merged mesh's UV
+set is renamed to one shared name (`mergedAtlas`) and reassigned to one
+new shading group; the old per-page `atlasFileN`/`atlasPlace2dN`/
+`atlasShaderN`/`atlasSGN` nodes are deleted once nothing references them,
+but their PNG files are left on disk untouched.
+
+Known limitation: since different atlas pages are independently packed
+sprite sheets with no relationship to each other's pixel layout, directly
+superimposing them can coincidentally overlap unrelated content (page 0's
+sky at some pixel landing on top of page 1's rock at that same pixel) --
+this is an accepted consequence of merging pages literally as whole
+images rather than recomputing a new non-overlapping packing.
+
+No-ops (returns `None`, changes nothing) if fewer than two atlas pages
+currently have both an existing mesh and a resolvable texture on disk.
 """
 
 from __future__ import annotations
@@ -104,6 +164,51 @@ def _read_current_local_xy_and_uvs(shape: str) -> Tuple[List[Point], List[Point]
     xy = [(points[i].x, points[i].y) for i in range(len(points))]
     uv = list(zip(u_array, v_array))
     return xy, uv
+
+
+def _write_uv_set(shape: str, local_xy: List[Point], affine, uv_set_name: str) -> None:
+    """Write `affine` evaluated at `local_xy` into `uv_set_name` on `shape`, creating it if needed.
+
+    Two uses in this module: writing a fresh live mapping into whatever UV
+    set is currently "current" (`merge_textures`), and preserving a
+    snapshot of a mapping that's about to be overwritten into a separate,
+    newly created set (both `rebuild_textures_from_uv_layout`'s
+    `<uvSet>_original` and `merge_textures`'s `<uvSet>_premerge`) -- so a
+    mesh naturally accumulates multiple UV sets as it goes through more of
+    this package's steps. New UV sets are appended after existing ones
+    (verified: creating a second UV set does not disturb the first one's
+    index or which set is "current"), so writing a *new* named set here
+    never disturbs the `uvSet[0]` the rest of this module and
+    `maya_backend._sort_into_uv_set` rely on for the live/textured set.
+
+    Each snapshot name is a rolling one-generation history, not an
+    unbounded log: if `uv_set_name` already exists, its data is simply
+    overwritten rather than accumulating `_2`, `_3`, ... suffixes.
+    """
+    import maya.api.OpenMaya as om2  # noqa: PLC0415
+    import maya.cmds as cmds  # noqa: PLC0415
+
+    if uv_set_name not in (cmds.polyUVSet(shape, query=True, allUVSets=True) or []):
+        cmds.polyUVSet(shape, create=True, uvSet=uv_set_name)
+
+    a, b, c, d, e, f = affine
+    u_array = om2.MFloatArray([a * x + b * y + c for x, y in local_xy])
+    v_array = om2.MFloatArray([d * x + e * y + f for x, y in local_xy])
+
+    sel = om2.MSelectionList()
+    sel.add(shape)
+    dag = sel.getDagPath(0)
+    fn_mesh = om2.MFnMesh(dag)
+
+    face_counts, face_verts = [], []
+    for face_index in range(fn_mesh.numPolygons):
+        verts = fn_mesh.getPolygonVertices(face_index)
+        face_counts.append(len(verts))
+        face_verts.extend(verts)
+
+    fn_mesh.clearUVs(uv_set_name)
+    fn_mesh.setUVs(u_array, v_array, uv_set_name)
+    fn_mesh.assignUVs(om2.MIntArray(face_counts), om2.MIntArray(face_verts), uv_set_name)
 
 
 def _pad_edge_replicate(image, pad: int):
@@ -208,7 +313,7 @@ def rebuild_textures_from_uv_layout(
     import maya.cmds as cmds  # noqa: PLC0415
     from PIL import Image  # noqa: PLC0415
 
-    from .maya_backend import _tag_uv_affine  # noqa: PLC0415 -- local import to avoid a cycle
+    from .maya_backend import _tag_uv_affine, read_uv_affine  # noqa: PLC0415 -- local import to avoid a cycle
     from .psd_reader import extract_layers  # noqa: PLC0415
 
     psd_path = psd_path or scene.source_psd
@@ -250,6 +355,11 @@ def rebuild_textures_from_uv_layout(
             local_xy, new_uv = _read_current_local_xy_and_uvs(shape)
             _rebake_shell(layer.pixels, scene.pixels_per_unit, local_xy, new_uv, page.width, page.height, canvas)
 
+            old_affine = read_uv_affine(mesh.maya_name)
+            if old_affine is not None:
+                current_uv_set = cmds.polyUVSet(shape, query=True, currentUVSet=True)[0]
+                _write_uv_set(shape, local_xy, old_affine, f"{current_uv_set}_original")
+
             new_affine = _fit_affine(local_xy, new_uv)
             _tag_uv_affine(mesh.maya_name, new_affine)
             rebaked += 1
@@ -272,3 +382,125 @@ def rebuild_textures_from_uv_layout(
         logger.info("Rebaked atlas page %d -> %s (%d mesh(es))", page.index, new_path, rebaked)
 
     return new_paths
+
+
+def merge_textures(scene: SceneData, out_dir: Optional[str] = None) -> Optional[str]:
+    """Superimpose every atlas page still in use into one merged PNG, and repoint
+    the existing meshes at it. Creates no new geometry.
+
+    See the module docstring's "Superimposing the atlas texture PNGs
+    themselves" section for the full design rationale. Returns the merged
+    texture's path, or None if fewer than two atlas pages currently have
+    both an existing mesh and a resolvable texture on disk (nothing to
+    merge).
+    """
+    import maya.cmds as cmds  # noqa: PLC0415
+    from PIL import Image  # noqa: PLC0415
+
+    from .maya_backend import _tag_uv_affine, read_uv_affine  # noqa: PLC0415 -- local import to avoid a cycle
+
+    meshes_by_page: Dict[int, list] = defaultdict(list)
+    for mesh in scene.meshes:
+        if cmds.objExists(mesh.maya_name):
+            meshes_by_page[mesh.atlas_page].append(mesh)
+
+    page_file_nodes: Dict[int, str] = {}
+    page_images: Dict[int, object] = {}
+    page_paths: Dict[int, str] = {}
+    for page in scene.atlas_pages:
+        if page.index not in meshes_by_page:
+            continue
+        file_node = f"atlasFile{page.index}"
+        if not cmds.objExists(file_node):
+            logger.warning("File node %r missing for atlas page %d; leaving it out of the merge", file_node, page.index)
+            continue
+        tex_path = cmds.getAttr(f"{file_node}.fileTextureName")
+        if not tex_path or not os.path.isfile(tex_path):
+            logger.warning(
+                "Texture %r for atlas page %d not found on disk; leaving it out of the merge", tex_path, page.index
+            )
+            continue
+        page_file_nodes[page.index] = file_node
+        page_paths[page.index] = tex_path
+        page_images[page.index] = Image.open(tex_path).convert("RGBA")
+
+    if len(page_images) < 2:
+        logger.info("Fewer than two atlas pages have both an existing mesh and a texture; nothing to merge.")
+        return None
+
+    out_dir = out_dir or os.path.dirname(next(iter(page_paths.values())))
+
+    # Stack, don't pack: every page is pasted at its own native resolution at
+    # the same (0, 0) origin -- like Photoshop's Merge Layers/Flatten Image --
+    # onto a canvas sized to the largest page, in ascending page-index order.
+    merged_w = max(img.width for img in page_images.values())
+    merged_h = max(img.height for img in page_images.values())
+    canvas = Image.new("RGBA", (merged_w, merged_h), (0, 0, 0, 0))
+    for page_index in sorted(page_images):
+        canvas.alpha_composite(page_images[page_index], (0, 0))
+
+    merged_path = os.path.join(out_dir, "merged_atlas.png")
+    canvas.save(merged_path)
+
+    # One shared shading network for everything, matching maya_backend.build_in_maya's
+    # per-page naming pattern but singular, since there's only one texture now.
+    file_node = cmds.shadingNode("file", asTexture=True, isColorManaged=True, name="mergedAtlasFile")
+    cmds.setAttr(f"{file_node}.fileTextureName", merged_path, type="string")
+    cmds.setAttr(f"{file_node}.alphaIsLuminance", False)
+    place2d = cmds.shadingNode("place2dTexture", asUtility=True, name="mergedAtlasPlace2d")
+    cmds.connectAttr(f"{place2d}.outUV", f"{file_node}.uvCoord")
+    cmds.connectAttr(f"{place2d}.outUvFilterSize", f"{file_node}.uvFilterSize")
+    shader = cmds.shadingNode("lambert", asShader=True, name="mergedAtlasShader")
+    cmds.connectAttr(f"{file_node}.outColor", f"{shader}.color")
+    cmds.connectAttr(f"{file_node}.outTransparency", f"{shader}.transparency")
+    sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name="mergedAtlasSG")
+    cmds.connectAttr(f"{shader}.outColor", f"{sg}.surfaceShader", force=True)
+
+    merged_uv_set_name = "mergedAtlas"
+    merged_count = 0
+    for page_index, meshes in meshes_by_page.items():
+        if page_index not in page_images:
+            continue
+        page = next(p for p in scene.atlas_pages if p.index == page_index)
+
+        # Closed-form remap, no fitting needed: every page shares the same
+        # (0, 0) origin in the merged canvas (a stack, not a pack), so only a
+        # scale is needed, never a translation -- new_u = q*u, new_v = (1-s) + s*v
+        # (the v-flip convention means a page's own top edge, v=1, must still
+        # land at the merged canvas's v=1 only when the page is as tall as the
+        # canvas; shorter pages' v=1 lands at (1-s) + s*1 = 1, always correct,
+        # while v=0 lands at 1-s, i.e. flush with the canvas's own bottom
+        # margin above y=merged_h).
+        q = page.width / merged_w
+        s = page.height / merged_h
+
+        for mesh in meshes:
+            old_affine = read_uv_affine(mesh.maya_name)
+            if old_affine is None:
+                logger.warning("Mesh %r has no psdUv* attributes; leaving it out of the merge", mesh.maya_name)
+                continue
+            a, b, c, d, e, f = old_affine
+            new_affine = (q * a, q * b, q * c, s * d, s * e, (1.0 - s) + s * f)
+
+            shape = cmds.listRelatives(mesh.maya_name, shapes=True, fullPath=True)[0]
+            local_xy, _ = _read_current_local_xy_and_uvs(shape)
+            current_uv_set = cmds.polyUVSet(shape, query=True, currentUVSet=True)[0]
+
+            _write_uv_set(shape, local_xy, old_affine, f"{current_uv_set}_premerge")
+            _write_uv_set(shape, local_xy, new_affine, current_uv_set)
+            _tag_uv_affine(mesh.maya_name, new_affine)
+
+            if current_uv_set != merged_uv_set_name:
+                cmds.polyUVSet(shape, rename=True, uvSet=current_uv_set, newUVSet=merged_uv_set_name)
+
+            cmds.sets(shape, edit=True, forceElement=sg)
+            cmds.uvLink(make=True, uvSet=f"{shape}.uvSet[0].uvSetName", texture=file_node)
+            merged_count += 1
+
+    for page_index, old_file_node in page_file_nodes.items():
+        for node in (old_file_node, f"atlasPlace2d{page_index}", f"atlasShader{page_index}", f"atlasSG{page_index}"):
+            if cmds.objExists(node):
+                cmds.delete(node)
+
+    logger.info("Merged %d atlas page(s) (%d mesh(es)) -> %s", len(page_images), merged_count, merged_path)
+    return merged_path

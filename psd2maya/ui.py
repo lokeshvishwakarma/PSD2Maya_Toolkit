@@ -25,7 +25,7 @@ from shiboken6 import wrapInstance
 from .layer_tree import LayerNode, read_layer_tree
 from .maya_backend import build_in_maya
 from .pipeline import run_pipeline
-from .relayout import rebuild_textures_from_uv_layout
+from .relayout import merge_textures, rebuild_textures_from_uv_layout
 
 WINDOW_OBJECT_NAME = "psd2mayaBuildWindow"
 
@@ -188,6 +188,16 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         )
         layout.addWidget(self.rebuild_texture_btn)
 
+        self.merge_textures_btn = QtWidgets.QPushButton("Merge Textures", self)
+        self.merge_textures_btn.setEnabled(False)
+        self.merge_textures_btn.setToolTip(
+            "Superimpose every existing mesh's current texture appearance (in PSD "
+            "paint order) into one flattened image of the whole canvas, and apply "
+            "it to a new flat backdrop card -- reflects any Layout UV / Rebuild "
+            "Texture changes you've already made."
+        )
+        layout.addWidget(self.merge_textures_btn)
+
     def _connect_signals(self):
         self.browse_btn.clicked.connect(self._on_browse)
         self.retopo_chk.toggled.connect(self.target_face_count_spin.setEnabled)
@@ -195,6 +205,7 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.path_edit.returnPressed.connect(lambda: self._load_psd(self.path_edit.text().strip()))
         self.build_btn.clicked.connect(self._on_build_mesh)
         self.rebuild_texture_btn.clicked.connect(self._on_rebuild_texture)
+        self.merge_textures_btn.clicked.connect(self._on_merge_textures)
 
     # -- PSD loading / tree population -----------------------------------
 
@@ -301,6 +312,7 @@ class Psd2MayaWindow(QtWidgets.QDialog):
 
         self._last_scene = scene
         self.rebuild_texture_btn.setEnabled(True)
+        self.merge_textures_btn.setEnabled(True)
 
         total_faces = sum(cmds.polyEvaluate(m.maya_name, face=True) for m in scene.meshes)
         topo = "polyRetopo" if self.retopo_chk.isChecked() else "traced quads"
@@ -343,6 +355,32 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             self._set_status("No UV sets had any rebakeable meshes -- nothing was changed.", error=True)
             return
         self._set_status(f"Rebaked {len(new_paths)} atlas page(s): {', '.join(new_paths.values())}")
+
+    def _on_merge_textures(self):
+        if self._last_scene is None:
+            self._set_status("Build Mesh first -- nothing to merge yet.", error=True)
+            return
+
+        self.merge_textures_btn.setEnabled(False)
+        self._set_status("Flattening current textures into one backdrop...")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        cmds.waitCursor(state=True)
+        try:
+            flattened_path = merge_textures(self._last_scene)
+        except Exception as exc:
+            traceback.print_exc()
+            self._set_status(f"Texture flatten failed: {exc}", error=True)
+            QtWidgets.QMessageBox.critical(self, "Merge Textures Failed", str(exc))
+            return
+        finally:
+            cmds.waitCursor(state=False)
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.merge_textures_btn.setEnabled(True)
+
+        if flattened_path is None:
+            self._set_status("No existing mesh had a resolvable current texture -- nothing to flatten.")
+            return
+        self._set_status(f"Flattened backdrop applied to 'psd2mayaFlattenedBackdrop': {flattened_path}")
 
     def _set_status(self, text: str, error: bool = False):
         color = "#ff6b6b" if error else "#9fd39f"
