@@ -94,7 +94,9 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.setObjectName(WINDOW_OBJECT_NAME)
         self.setWindowTitle("PSD to Maya - Parallax Rig Builder")
         self.setMinimumSize(520, 560)
-        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
+        self.setWindowFlags(
+            (self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint) | QtCore.Qt.WindowStaysOnTopHint
+        )
 
         self._canvas_size = None  # (width, height) of the currently loaded PSD
         self._last_scene = None  # SceneData from the most recent successful Build Mesh
