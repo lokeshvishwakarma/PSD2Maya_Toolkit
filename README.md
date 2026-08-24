@@ -187,31 +187,36 @@ dataclasses are the only thing they share.
   PSD's layers haven't moved/resized since the rig was built (the original
   local<->pixel mapping isn't re-derived), and rebaked shells get no
   bleed-padding border the way the original atlas packing gives them.
-- **Flattening every mesh's current appearance into one backdrop, on
-  request.** A further, independent manual step (`relayout.merge_textures`,
-  the "Merge Textures" button) for whoever wants a single flat composited
-  image of the whole scene -- e.g. after hand-tweaking pieces via Layout
-  UV/Rebuild Texture and wanting to see (or ship) the final result as a
-  flat backdrop, separate from the parallax rig's own meshes. This
-  superimposes every existing mesh's *current* texture appearance (however
-  it currently samples -- the original atlas placement or a Layout-UV-
-  rebaked one) on top of each other in PSD paint order (alpha-composited,
-  like Photoshop's Flatten Image) into one picture of the whole canvas,
-  and applies it to a single new flat card. No PSD access and no per-
-  vertex fitting needed: each mesh's *live* local vertex bounding box
-  (read straight from Maya, so it's correct after retopo/relayout too)
-  gives exactly the canvas-pixel rectangle it occupies, and composing that
-  fixed canvas-pixel<->local-position conversion with the mesh's current
-  `psdUv*` affine gives one exact affine straight to "current texture
-  pixel" -- verified against `psd-tools`' own full-canvas composite
-  (independent ground truth): 99.2% of sampled pixels match exactly, with
-  the rest sitting on hard layer-boundary rows (the same edge-rounding
-  ambiguity noted elsewhere in this doc). The card is placed one
-  `depth_step` further back than every other mesh so it renders behind the
-  whole rig, and re-running this replaces the previous backdrop
-  card/material rather than creating another one. Known limitation: like
-  the rest of this package, only normal-mode alpha compositing is
-  modeled -- Photoshop blend modes between layers aren't.
+- **Superimposing the atlas texture PNGs themselves, on request.** A
+  further, independent manual step (`relayout.merge_textures`, the "Merge
+  Textures" button) for whoever wants every atlas page down to one PNG and
+  one material. This is a literal thing, not a scene-geometry thing: every
+  atlas page still in use has its own PNG on disk (the original packed
+  atlas, or a Layout-UV-rebaked one), and `merge_textures` superimposes
+  those PNG files directly on top of each other -- the same operation as
+  selecting every layer in Photoshop and choosing Merge Layers/Flatten
+  Image, just applied to this package's own generated PNGs instead of PSD
+  layers -- into one merged PNG, then repoints the *existing* meshes at
+  it. It creates no new geometry: every mesh keeps its own shape and
+  position, just with its UVs and shading updated. Each page is pasted at
+  its native resolution at the same `(0, 0)` origin as every other page
+  (a stack, not a pack -- no resizing, no repositioning), in ascending
+  page-index order, onto a canvas sized to the largest page; a smaller
+  page simply doesn't cover the rest of it rather than being stretched to
+  fill it. Because pages aren't resized, each mesh's UV mapping only needs
+  a closed-form *scale* (never a translation, since every page shares the
+  same origin) composed directly with its existing `psdUv*` affine -- no
+  per-vertex fitting involved. Same rolling-snapshot behavior as the
+  Layout UV rebake: each mesh's pre-merge mapping is preserved as another
+  UV set (`<uvSet>_premerge`) before being overwritten, and every merged
+  mesh's UV set is renamed to one shared name (`mergedAtlas`) and
+  reassigned to one new shading group; the old per-page nodes are deleted
+  once nothing references them, but their PNG files are left on disk
+  untouched. Known limitation: since different atlas pages are
+  independently packed sprite sheets with no relationship to each other's
+  pixel layout, directly superimposing them can coincidentally overlap
+  unrelated content -- an accepted consequence of merging pages literally
+  as whole images rather than recomputing a new non-overlapping packing.
 - **Hidden layers, empty layers, and groups are skipped**, not
   recreated as empty meshes. Text/shape/smart-object layers are
   rasterized via `layer.composite()` like everything else -- there's no
@@ -358,14 +363,14 @@ from psd2maya.relayout import rebuild_textures_from_uv_layout
 rebuild_textures_from_uv_layout(scene)   # the SceneData from run_pipeline/build_in_maya
 ```
 
-To flatten every existing mesh's current texture appearance into one
-composited backdrop image and apply it to a new flat card (see the
-"Flattening every mesh's current appearance" design note above), click
-**Merge Textures** in the UI, or call it directly:
+To superimpose every atlas page still in use into one merged PNG and
+repoint the existing meshes at it -- no new geometry created (see the
+"Superimposing the atlas texture PNGs themselves" design note above),
+click **Merge Textures** in the UI, or call it directly:
 
 ```python
 from psd2maya.relayout import merge_textures
-merge_textures(scene)   # returns the flattened PNG's path, or None if there was nothing to flatten
+merge_textures(scene)   # returns the merged PNG's path, or None if there was nothing to merge
 ```
 
 ## Testing

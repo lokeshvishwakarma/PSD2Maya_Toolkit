@@ -191,10 +191,9 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.merge_textures_btn = QtWidgets.QPushButton("Merge Textures", self)
         self.merge_textures_btn.setEnabled(False)
         self.merge_textures_btn.setToolTip(
-            "Superimpose every existing mesh's current texture appearance (in PSD "
-            "paint order) into one flattened image of the whole canvas, and apply "
-            "it to a new flat backdrop card -- reflects any Layout UV / Rebuild "
-            "Texture changes you've already made."
+            "Superimpose every atlas page still in use into one merged PNG "
+            "(like merging layers in Photoshop) and repoint the existing "
+            "meshes at it. Creates no new geometry."
         )
         layout.addWidget(self.merge_textures_btn)
 
@@ -362,14 +361,14 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             return
 
         self.merge_textures_btn.setEnabled(False)
-        self._set_status("Flattening current textures into one backdrop...")
+        self._set_status("Superimposing atlas textures into one merged PNG...")
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         cmds.waitCursor(state=True)
         try:
-            flattened_path = merge_textures(self._last_scene)
+            merged_path = merge_textures(self._last_scene)
         except Exception as exc:
             traceback.print_exc()
-            self._set_status(f"Texture flatten failed: {exc}", error=True)
+            self._set_status(f"Texture merge failed: {exc}", error=True)
             QtWidgets.QMessageBox.critical(self, "Merge Textures Failed", str(exc))
             return
         finally:
@@ -377,10 +376,10 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             QtWidgets.QApplication.restoreOverrideCursor()
             self.merge_textures_btn.setEnabled(True)
 
-        if flattened_path is None:
-            self._set_status("No existing mesh had a resolvable current texture -- nothing to flatten.")
+        if merged_path is None:
+            self._set_status("Fewer than two atlas pages have both an existing mesh and a texture -- nothing to merge.")
             return
-        self._set_status(f"Flattened backdrop applied to 'psd2mayaFlattenedBackdrop': {flattened_path}")
+        self._set_status(f"Merged atlas pages into one material: {merged_path}")
 
     def _set_status(self, text: str, error: bool = False):
         color = "#ff6b6b" if error else "#9fd39f"
