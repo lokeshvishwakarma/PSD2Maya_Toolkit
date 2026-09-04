@@ -25,6 +25,18 @@ dagSetMembers -- the same mechanism Maya itself uses to store shading
 assignment in a scene file (this is the file-format equivalent of running
 `sets -e -forceElement` interactively).
 
+Group hierarchy
+----------------
+Each mesh's `group_path` (see mesh_builder._resolve_group_path) is a chain
+of already-unique, already Maya-safe names -- `_ensure_group_chain` just
+needs to emit one `createNode transform` per name the first time it's
+seen and remember that it has, so a folder shared by many meshes gets a
+single group node reused by all of them rather than being recreated (and
+Maya erroring on a duplicate node name) for every mesh underneath it.
+Because every name in the whole scene is globally unique (see
+mesh_builder), checking "have I created this name yet" needs only a flat
+set, not a full path-tuple key.
+
 This has been written to match Maya's documented ASCII format but has not
 been round-tripped through a real Maya install in this environment (none is
 available here) -- open the result in Maya and check the Outliner/UVs
@@ -69,12 +81,23 @@ class _EdgeTable:
         return self._edges
 
 
-def _write_mesh(w, mesh: LayerMesh) -> None:
+def _ensure_group_chain(w, group_path, created: set, root_name: str) -> str:
+    """Emit any not-yet-created group transforms in `group_path`; return the innermost name."""
+    parent = root_name
+    for name in group_path:
+        if name not in created:
+            w(f'createNode transform -n "{name}" -p "{parent}";')
+            created.add(name)
+        parent = name
+    return parent
+
+
+def _write_mesh(w, mesh: LayerMesh, parent: str) -> None:
     x, y, z = mesh.translate
     transform_name = mesh.maya_name
     shape_name = f"{mesh.maya_name}Shape"
 
-    w(f'createNode transform -n "{transform_name}" -p "psd2maya_root";')
+    w(f'createNode transform -n "{transform_name}" -p "{parent}";')
     w(f'	setAttr ".t" -type "double3" {_f(x)} {_f(y)} {_f(z)} ;')
     w(f'createNode mesh -n "{shape_name}" -p "{transform_name}";')
     w('	setAttr -k off ".v";')
@@ -144,9 +167,11 @@ def write_ma(scene: SceneData, out_path: str, atlas_texture_paths: Dict[int, str
 
     sg_member_counters = {page.index: 0 for page in scene.atlas_pages}
     sg_connections = []
+    created_groups: set = set()
 
     for mesh in scene.meshes:
-        _write_mesh(w, mesh)
+        parent = _ensure_group_chain(w, mesh.group_path, created_groups, "psd2maya_root")
+        _write_mesh(w, mesh, parent)
 
         sg = f"atlasSG{mesh.atlas_page}"
         idx = sg_member_counters[mesh.atlas_page]

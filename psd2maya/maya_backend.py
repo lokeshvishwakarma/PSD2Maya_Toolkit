@@ -205,6 +205,27 @@ def _sort_into_uv_set(shape: str, uv_set_name: str, file_node: str) -> None:
     cmds.uvLink(make=True, uvSet=f"{shape}.uvSet[0].uvSetName", texture=file_node)
 
 
+def _ensure_group_chain(group_path, created: Dict[str, str], root: str) -> str:
+    """Create/reuse `group_path`'s chain of empty group transforms under `root`.
+
+    `created` maps a group's (globally-unique, see mesh_builder) name to its
+    already-created DAG node, so a folder shared by many meshes gets one
+    group reused by all of them instead of `cmds.group` being asked to
+    create the same name twice (which would just auto-suffix it, silently
+    producing a second, wrong group rather than erroring).
+    """
+    import maya.cmds as cmds  # noqa: PLC0415
+
+    parent = root
+    for name in group_path:
+        node = created.get(name)
+        if node is None:
+            node = cmds.group(empty=True, name=name, parent=parent)
+            created[name] = node
+        parent = node
+    return parent
+
+
 def build_in_maya(
     scene: SceneData,
     atlas_texture_paths: Dict[int, str],
@@ -215,6 +236,11 @@ def build_in_maya(
 ) -> str:
     """Build `scene` in the currently open Maya session. Returns the root transform's name.
 
+    Each mesh is parented under a chain of empty group transforms matching
+    its PSD folder path (see mesh_builder._resolve_group_path), reusing a
+    folder's group across every mesh inside it rather than recreating one
+    per mesh.
+
     Pass a list as `retopo_failures` to find out which meshes fell back to
     their original traced topology. Worth checking: the fallback is also
     all-quads, so a face/quad audit alone can't distinguish "retopologized"
@@ -224,6 +250,7 @@ def build_in_maya(
     import maya.cmds as cmds  # noqa: PLC0415
 
     root = cmds.group(empty=True, name=root_name)
+    created_groups: Dict[str, str] = {}
 
     shading_groups = {}
     file_nodes = {}
@@ -254,7 +281,8 @@ def build_in_maya(
 
         cmds.xform(transform, worldSpace=True, translation=mesh.translate)
         cmds.rename(transform, mesh.maya_name)
-        cmds.parent(mesh.maya_name, root)
+        parent = _ensure_group_chain(mesh.group_path, created_groups, root)
+        cmds.parent(mesh.maya_name, parent)
         _tag_uv_affine(mesh.maya_name, mesh.uv_affine)
 
         if retopo:

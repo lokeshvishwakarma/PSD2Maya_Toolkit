@@ -22,6 +22,11 @@ class SourceLayer:
     bottom: int
     opacity: float  # 0..1
     pixels: object  # PIL.Image.Image (RGBA), cropped to (left, top, right, bottom)
+    # Raw PSD group names enclosing this layer, root-to-immediate-parent order,
+    # e.g. ("Foliage", "Bushes") for a layer nested two folders deep. Empty for
+    # a layer sitting at the canvas's top level. Not yet Maya-safe/deduped --
+    # see mesh_builder._resolve_group_path for that.
+    group_path: tuple = ()
 
     @property
     def width(self) -> int:
@@ -86,6 +91,11 @@ class LayerMesh:
     # translated/scaled -- see maya_backend.reproject_uvs and
     # relayout.rebuild_textures_from_uv_layout.
     uv_affine: tuple = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # (a, b, c, d, e, f)
+    # Maya-safe, globally-deduped group transform names this mesh nests under,
+    # root-to-immediate-parent order (empty if it sits directly under the scene
+    # root). Both backends create/reuse this chain of group transforms and
+    # parent the mesh under its last element -- see mesh_builder._resolve_group_path.
+    group_path: tuple = ()
 
 
 @dataclass
