@@ -26,13 +26,34 @@ A layer with more than one disconnected opaque region (e.g. two separate
 rocks) traces to more than one shell; each shell becomes its own
 LayerMesh, name-suffixed, so it still shows up as distinct geometry rather
 than silently only keeping one piece.
+
+Group hierarchy
+----------------
+Each `SourceLayer.group_path` (raw PSD group names, see psd_reader) is
+resolved into a Maya-safe, globally-deduped chain via
+`_resolve_group_path`, memoized per raw path so every layer sharing a
+folder gets back the *exact same* resolved chain rather than each
+independently re-sanitizing/deduping its ancestors (which could otherwise
+disagree on a suffix if two same-named groups existed elsewhere in the
+tree). Group names are deduped against the same `used_names` set as mesh
+transform names, so a group and a mesh can never collide either -- the
+simple global-uniqueness rule this package already used for mesh names
+(Maya itself only requires uniqueness among siblings, but checking
+globally is always safe, just occasionally more conservative than
+strictly necessary). One known gap: two *sibling* PSD groups that share
+the exact same name are indistinguishable by name alone and merge into a
+single Maya group -- rare in practice (Photoshop doesn't enforce unique
+folder names, but duplicating a folder without renaming it is the only
+way to hit this), and each layer's own mesh is still built correctly
+either way; only the grouping is coarser than the source PSD in that one
+case.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import List
+from typing import Dict, List, Tuple
 
 from .contour_tracer import trace_layer_contours
 from .quadrangulate import quadrangulate_polygon
@@ -52,6 +73,23 @@ def _maya_safe_name(raw: str, used: set) -> str:
         candidate = f"{name}_{n}"
     used.add(candidate)
     return candidate
+
+
+def _resolve_group_path(
+    raw_path: Tuple[str, ...],
+    used_names: set,
+    cache: Dict[Tuple[str, ...], Tuple[str, ...]],
+) -> Tuple[str, ...]:
+    """Resolve a raw PSD group-name chain into a Maya-safe, deduped chain, memoized."""
+    if not raw_path:
+        return ()
+    resolved = cache.get(raw_path)
+    if resolved is not None:
+        return resolved
+    parent_resolved = _resolve_group_path(raw_path[:-1], used_names, cache)
+    resolved = parent_resolved + (_maya_safe_name(raw_path[-1], used_names),)
+    cache[raw_path] = resolved
+    return resolved
 
 
 def _pixel_to_local_and_uv(
@@ -151,11 +189,13 @@ def build_scene(
     page_dims = {p.index: (p.width, p.height) for p in atlas.pages}
 
     used_names: set = set()
+    group_path_cache: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
     meshes: List[LayerMesh] = []
 
     for layer in sorted(layers, key=lambda l: l.stack_index):
         placement = placement_by_index[layer.stack_index]
         page_w, page_h = page_dims[placement.page]
+        resolved_group_path = _resolve_group_path(layer.group_path, used_names, group_path_cache)
 
         cx_px = (layer.left + layer.right) / 2.0
         cy_px = (layer.top + layer.bottom) / 2.0
@@ -205,6 +245,7 @@ def build_scene(
                     uvs=uvs,
                     faces=faces,
                     uv_affine=_uv_affine(layer, placement, page_w, page_h, pixels_per_unit),
+                    group_path=resolved_group_path,
                 )
             )
 

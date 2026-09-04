@@ -13,7 +13,7 @@ order, all textured from a single packed atlas PNG with matching UVs.
      v
  psd_reader.py     -- psd-tools         --> list[SourceLayer]
      |                                       (name, bbox, cropped RGBA pixels,
-     |                                        opacity, stack order)
+     |                                        opacity, stack order, group path)
      v
  atlas_packer.py   -- Pillow only       --> AtlasResult
      |                                       (1+ atlas pages, per-layer
@@ -29,7 +29,8 @@ order, all textured from a single packed atlas PNG with matching UVs.
      v
  mesh_builder.py   -- pure Python       --> SceneData
      |                                       (world-placed, UV-mapped,
-     |                                        winding-corrected quad meshes)
+     |                                        winding-corrected quad meshes,
+     |                                        resolved Maya group hierarchy)
      v
    +-------------------------+-------------------------------+
    |                         |
@@ -121,10 +122,26 @@ dataclasses are the only thing they share.
   fails on a given shell it's logged and that mesh keeps its original
   traced topology rather than aborting the build.
 - **One mesh per layer (or per shell), not one shared mesh.** Each
-  traced shell becomes its own transform + mesh, parented under a common
-  `psd2maya_root` group. This is what makes it a *parallax rig* rather
-  than a flat cutout: each piece can be independently offset, hidden, or
-  animated later.
+  traced shell becomes its own transform + mesh. This is what makes it a
+  *parallax rig* rather than a flat cutout: each piece can be
+  independently offset, hidden, or animated later.
+- **PSD group hierarchy preserved as nested Maya groups.** A layer's
+  enclosing folders (`psd_reader`'s `group_path`) become a chain of empty
+  group transforms in Maya, and the mesh is parented under the innermost
+  one -- open the Outliner and it matches the Photoshop Layers panel's
+  folder structure, not one flat pile under the scene root. A folder
+  shared by many layers gets one group, reused (`export_ma._ensure_group_chain`
+  / `maya_backend._ensure_group_chain`), not recreated per layer. Group
+  names go through the same Maya-safe sanitizing/deduping as mesh names,
+  off the *same* shared name registry (`mesh_builder._resolve_group_path`),
+  so a group and a mesh can never collide either. Layers loose at the
+  canvas's top level (no enclosing folder) still land directly under
+  `psd2maya_root`, unchanged from before. Known gap: two sibling PSD
+  folders that share the exact same name are indistinguishable by name
+  alone and merge into one Maya group -- rare (requires duplicating a
+  folder without renaming it), and every layer's own mesh is still built
+  correctly either way; only the grouping is coarser than the source PSD
+  in that one case.
 - **Depth from PSD stack order.** The PSD format stores layer records
   bottom-to-top (see `psd_reader.py` docstring); layer 0 in that order is
   placed at `Z=0` and each subsequent layer steps forward by
@@ -217,10 +234,13 @@ dataclasses are the only thing they share.
   pixel layout, directly superimposing them can coincidentally overlap
   unrelated content -- an accepted consequence of merging pages literally
   as whole images rather than recomputing a new non-overlapping packing.
-- **Hidden layers, empty layers, and groups are skipped**, not
+- **Hidden layers and empty layers are skipped** entirely -- not
   recreated as empty meshes. Text/shape/smart-object layers are
   rasterized via `layer.composite()` like everything else -- there's no
-  special-casing by layer kind.
+  special-casing by layer kind. Groups are never rasterized into a mesh
+  either, but (unlike hidden/empty layers) they aren't simply discarded --
+  their nesting is preserved as empty organizational Maya groups, see
+  above.
 - **Absolute texture paths.** `fileTextureName` is written as an absolute
   path rather than relative, because Maya resolves relative texture paths
   against the current project's `sourceimages` directory, not against the
@@ -389,3 +409,13 @@ Quad-only-ness, face winding, and how tightly the traced boundary hugs
 each layer's silhouette were all checked directly against this fixture's
 output (see the design-decisions notes above) since there's no Maya
 install here to verify visually.
+
+Group-hierarchy preservation was checked two ways: against the real
+50-layer production PSD (two top-level folders, `Basegame_BG` and
+`Basegame_Reel`), confirming each folder's `createNode transform` appears
+exactly once in the `.ma` and every mesh parents under the right one; and
+against a hand-built fake layer tree exercising cases the production file
+doesn't have -- multi-level nesting and two sibling groups sharing a name
+-- confirming `psd_reader._iter_leaves`/`mesh_builder._resolve_group_path`
+handle both correctly (including the documented sibling-name-collision
+gap behaving exactly as described above).

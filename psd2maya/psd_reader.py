@@ -11,23 +11,45 @@ the bottom-most one in the Photoshop layers panel and the last is the
 topmost. `mesh_builder` relies on that to place background layers further
 from camera by default.
 
-Groups themselves are transparent: only rasterizable layers (pixel, text,
-shape, smart object, adjustment-with-pixels, ...) are returned. A group's
-own visibility/opacity already gates its children in psd-tools' compositing,
-so we don't need to special-case folders here beyond skipping the group
-node itself.
+Groups themselves are never returned as their own SourceLayer -- only
+rasterizable layers (pixel, text, shape, smart object, adjustment-with-pixels,
+...) are. A group's own visibility/opacity already gates its children in
+psd-tools' compositing, so we don't need to special-case folders here beyond
+recursing into them. Each returned layer does carry `group_path`, the chain
+of enclosing group names, so callers can still rebuild the folder structure
+(see mesh_builder._resolve_group_path) even though the groups themselves
+never become SourceLayers.
+
+`_iter_leaves` replaces what used to be a flat `psd.descendants()` loop with
+an equivalent recursive walk that additionally threads `group_path` down
+through each level. It's equivalent, not just similar: `descendants()` is
+itself `for layer in self: yield layer; if group: yield from layer.
+descendants()` -- a pre-order DFS that fully visits a group's subtree before
+moving to the next sibling -- which is exactly what recursing into a group
+immediately upon encountering it (below) also produces. So leaf order, and
+therefore `stack_index`/depth assignment, is unchanged from before this
+module tracked hierarchy at all.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import Iterator, List, Tuple
 
 from psd_tools import PSDImage
 
 from .scene_model import SourceLayer
 
 logger = logging.getLogger(__name__)
+
+
+def _iter_leaves(container, group_path: Tuple[str, ...] = ()) -> Iterator[Tuple[object, Tuple[str, ...]]]:
+    """Yield (leaf_layer, group_path) for every non-group descendant, in file order."""
+    for layer in container:
+        if layer.is_group():
+            yield from _iter_leaves(layer, group_path + (layer.name or "Group",))
+        else:
+            yield layer, group_path
 
 
 def extract_layers(
@@ -49,9 +71,7 @@ def extract_layers(
     stack_index = 0
     skipped = []
 
-    for layer in psd.descendants():
-        if layer.is_group():
-            continue
+    for layer, group_path in _iter_leaves(psd):
         if not include_hidden and not layer.visible:
             skipped.append((layer.name, "hidden"))
             continue
@@ -82,6 +102,7 @@ def extract_layers(
                 bottom=bbox[3],
                 opacity=opacity,
                 pixels=image,
+                group_path=group_path,
             )
         )
         stack_index += 1
