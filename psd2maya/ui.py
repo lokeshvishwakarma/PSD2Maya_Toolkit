@@ -459,6 +459,7 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             iterator += 1
         return lod_by_name
 
+
     # -- layer preview ------------------------------------------------------
 
     def _show_preview_placeholder(self, text: str):
