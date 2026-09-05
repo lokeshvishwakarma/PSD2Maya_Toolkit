@@ -10,6 +10,33 @@ possible here the way `maya_backend.py` does it for its build functions,
 because the widgets themselves need `maya.OpenMayaUI` to parent to the main
 window -- so, unlike the rest of the package, this module requires Maya
 (PySide6 + shiboken6, both shipped with Maya 2025+) to even import.
+
+Selecting a layer or group in the tree renders a live thumbnail beside it
+(over a transparency checkerboard) by calling `.composite()` on the
+`LayerNode.source` handle `layer_tree.read_layer_tree` stashed on it -- a
+single leaf goes straight through `.composite()` (already fast, bbox-
+limited), while a group instead goes through `layer_preview.
+render_group_thumbnail`'s downscale-first approximation, since a group's
+own `.composite()` blends every descendant at full PSD resolution just to
+be immediately shrunk to ~180px (see that module's docstring: 6-7s vs
+under half a second on a real 41-layer production group). Single-item
+results are cached per node for the lifetime of the loaded file, so
+revisiting an already-viewed item is instant.
+
+The tree supports multi-selection (ctrl/shift-click, same convention as
+any file browser). Selecting more than one item previews all of them
+composited together at their true relative position via `layer_preview.
+render_nodes_thumbnail` -- a deliberate choice over a blank "N selected"
+placeholder, since seeing what you're about to bulk-tag is more useful
+than seeing nothing, and it reuses the exact same fast per-leaf machinery
+as the single-group case. Right-clicking the tree opens a context menu to
+bulk-assign the LOD column (see below) to every selected row at once.
+
+The LOD column embeds a real `QComboBox` per row (`High`/`Mid`/`Low`) via
+`setItemWidget` rather than Qt's built-in click-to-edit item mechanism, so
+the current value is always visible without an extra click, and is purely
+a UI-side tag on `LayerNode.lod` right now -- nothing in the build
+pipeline reads it (yet).
 """
 
 from __future__ import annotations
@@ -22,6 +49,7 @@ import maya.OpenMayaUI as omui
 from PySide6 import QtCore, QtGui, QtWidgets
 from shiboken6 import wrapInstance
 
+from .layer_preview import render_group_thumbnail, render_nodes_thumbnail
 from .layer_tree import LayerNode, read_layer_tree
 from .maya_backend import build_in_maya
 from .pipeline import run_pipeline
@@ -37,12 +65,53 @@ _KIND_LABELS = {
     "smartobject": "Smart Object",
 }
 
+_PREVIEW_SIZE = 180
+_LAYER_NODE_ROLE = QtCore.Qt.UserRole
+
+_LOD_COLUMN = 3
+_LOD_LEVELS = ("High", "Mid", "Low")
+# Subtle background tints so a column of many rows scans at a glance without
+# fighting Maya's own dark theme -- not saturated enough to read as an alert.
+_LOD_COLORS = {"High": "#3d5a3d", "Mid": "#454545", "Low": "#5a3d3d"}
+
 
 def _maya_main_window():
     ptr = omui.MQtUtil.mainWindow()
     if ptr is None:
         return None
     return wrapInstance(int(ptr), QtWidgets.QWidget)
+
+
+def _checkerboard_pixmap(size: int, cell: int = 9) -> QtGui.QPixmap:
+    """A light/dark checkerboard, the usual "this is transparent" convention.
+
+    Built once per preview update (cheap at this size) rather than cached,
+    since it's only ever the backdrop a layer thumbnail gets painted over.
+    """
+    pixmap = QtGui.QPixmap(size, size)
+    light, dark = QtGui.QColor(90, 90, 90), QtGui.QColor(70, 70, 70)
+    painter = QtGui.QPainter(pixmap)
+    for y in range(0, size, cell):
+        for x in range(0, size, cell):
+            even = ((x // cell) + (y // cell)) % 2 == 0
+            painter.fillRect(x, y, cell, cell, light if even else dark)
+    painter.end()
+    return pixmap
+
+
+def _pil_to_qpixmap(image) -> QtGui.QPixmap:
+    """Convert a PIL RGBA image to a QPixmap.
+
+    `.copy()` on the QImage forces Qt to own its own copy of the pixel
+    buffer immediately -- without it, the QImage would keep referencing the
+    `bytes` object underneath, which Python is free to garbage-collect as
+    soon as this function returns, corrupting or crashing on whatever
+    tries to paint the pixmap afterward.
+    """
+    rgba = image.convert("RGBA")
+    raw = rgba.tobytes("raw", "RGBA")
+    qimage = QtGui.QImage(raw, rgba.width, rgba.height, QtGui.QImage.Format_RGBA8888).copy()
+    return QtGui.QPixmap.fromImage(qimage)
 
 
 class PsdDropLineEdit(QtWidgets.QLineEdit):
@@ -100,6 +169,12 @@ class Psd2MayaWindow(QtWidgets.QDialog):
 
         self._canvas_size = None  # (width, height) of the currently loaded PSD
         self._last_scene = None  # SceneData from the most recent successful Build Mesh
+        # id(LayerNode) -> QPixmap, cleared per file load (see _load_psd). Keyed by
+        # id() rather than the node itself: LayerNode is a plain @dataclass, so its
+        # auto-generated __eq__ makes it unhashable (__hash__ is None) -- and each
+        # node is only ever built once per tree anyway, so identity is exactly the
+        # right notion of "same node" here.
+        self._preview_cache = {}
 
         self._build_ui()
         self._connect_signals()
@@ -116,11 +191,36 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         path_row.addWidget(self.browse_btn)
         layout.addLayout(path_row)
 
+        tree_row = QtWidgets.QHBoxLayout()
+
         self.layer_tree = QtWidgets.QTreeWidget(self)
-        self.layer_tree.setHeaderLabels(["Layer", "Kind", "Opacity"])
-        self.layer_tree.setColumnWidth(0, 260)
+        self.layer_tree.setHeaderLabels(["Layer", "Kind", "Opacity", "LOD"])
+        self.layer_tree.setColumnWidth(0, 220)
+        self.layer_tree.setColumnWidth(_LOD_COLUMN, 90)
         self.layer_tree.setAlternatingRowColors(True)
-        layout.addWidget(self.layer_tree, 1)
+        self.layer_tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.layer_tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        tree_row.addWidget(self.layer_tree, 1)
+
+        preview_col = QtWidgets.QVBoxLayout()
+        self.preview_label = QtWidgets.QLabel(self)
+        self.preview_label.setFixedSize(_PREVIEW_SIZE, _PREVIEW_SIZE)
+        self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview_label.setFrameShape(QtWidgets.QFrame.Box)
+        self.preview_label.setStyleSheet("color: #888;")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setText("Select a layer\nto preview")
+        preview_col.addWidget(self.preview_label)
+
+        self.preview_info_label = QtWidgets.QLabel("", self)
+        self.preview_info_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview_info_label.setFixedWidth(_PREVIEW_SIZE)
+        self.preview_info_label.setWordWrap(True)
+        preview_col.addWidget(self.preview_info_label)
+        preview_col.addStretch(1)
+
+        tree_row.addLayout(preview_col)
+        layout.addLayout(tree_row, 1)
 
         self.canvas_label = QtWidgets.QLabel("No file loaded.", self)
         layout.addWidget(self.canvas_label)
@@ -205,6 +305,8 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.build_btn.clicked.connect(self._on_build_mesh)
         self.rebuild_texture_btn.clicked.connect(self._on_rebuild_texture)
         self.merge_textures_btn.clicked.connect(self._on_merge_textures)
+        self.layer_tree.itemSelectionChanged.connect(self._on_selection_changed)
+        self.layer_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
 
     # -- PSD loading / tree population -----------------------------------
 
@@ -229,6 +331,8 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         self.build_btn.setEnabled(False)
         self._canvas_size = None
         self.canvas_label.setText("No file loaded.")
+        self._show_preview_placeholder("Select a layer\nto preview")
+        self._preview_cache = {}
 
         if not os.path.isfile(path):
             self._set_status(f"File not found: {path}", error=True)
@@ -247,6 +351,19 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             self.layer_tree.addTopLevelItem(self._make_tree_item(node))
         self.layer_tree.expandAll()
 
+        # A second pass, after every item is actually in the tree: setItemWidget
+        # needs an item that already belongs to the widget to reliably attach,
+        # which isn't yet true of a child item at the point _make_tree_item
+        # builds it (it's only attached to its *parent* item so far, and that
+        # parent isn't in the tree yet either until this loop above runs).
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.layer_tree)
+        while iterator.value():
+            item = iterator.value()
+            node = item.data(0, _LAYER_NODE_ROLE)
+            if node is not None:
+                self._attach_lod_combo(item, node)
+            iterator += 1
+
         self.build_btn.setEnabled(True)
         self._set_status(f"Loaded {os.path.basename(path)}.")
 
@@ -254,6 +371,7 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         kind_label = "Group" if node.is_group else _KIND_LABELS.get(node.kind, node.kind)
         opacity_label = "" if node.is_group else f"{round(node.opacity * 100)}%"
         item = QtWidgets.QTreeWidgetItem([node.name, kind_label, opacity_label])
+        item.setData(0, _LAYER_NODE_ROLE, node)
 
         if not node.visible:
             grey = QtGui.QBrush(QtGui.QColor(120, 120, 120))
@@ -264,6 +382,136 @@ class Psd2MayaWindow(QtWidgets.QDialog):
         for child in node.children:
             item.addChild(self._make_tree_item(child))
         return item
+
+    # -- LOD column ---------------------------------------------------------
+
+    def _attach_lod_combo(self, item: QtWidgets.QTreeWidgetItem, node: LayerNode):
+        combo = QtWidgets.QComboBox(self.layer_tree)
+        combo.addItems(_LOD_LEVELS)
+        combo.setCurrentText(node.lod)
+        self._style_lod_combo(combo, node.lod)
+        # node=node, combo=combo: default-arg capture, since a plain closure
+        # over the loop variables in _load_psd's iterator would otherwise have
+        # every combo's callback see whatever `node`/`item` last ended up as.
+        combo.currentTextChanged.connect(lambda text, node=node, combo=combo: self._on_lod_changed(node, combo, text))
+        self.layer_tree.setItemWidget(item, _LOD_COLUMN, combo)
+
+    def _on_lod_changed(self, node: LayerNode, combo: QtWidgets.QComboBox, level: str):
+        node.lod = level
+        self._style_lod_combo(combo, level)
+
+    def _style_lod_combo(self, combo: QtWidgets.QComboBox, level: str):
+        color = _LOD_COLORS.get(level)
+        combo.setStyleSheet(f"QComboBox {{ background-color: {color}; }}" if color else "")
+
+    def _on_tree_context_menu(self, pos: QtCore.QPoint):
+        item = self.layer_tree.itemAt(pos)
+        if item is None:
+            return
+        # Right-clicking an item outside the current selection replaces the
+        # selection with just that one, matching most file browsers; right-
+        # clicking a row that's already part of a multi-selection leaves the
+        # whole selection intact so the menu below applies to all of it.
+        if item not in self.layer_tree.selectedItems():
+            self.layer_tree.setCurrentItem(item)
+
+        selected = self.layer_tree.selectedItems()
+        menu = QtWidgets.QMenu(self)
+        lod_menu = menu.addMenu(f"Set LOD ({len(selected)} selected)")
+        for level in _LOD_LEVELS:
+            action = lod_menu.addAction(level)
+            action.triggered.connect(lambda checked=False, level=level: self._assign_lod_to_selection(level))
+        menu.exec(self.layer_tree.viewport().mapToGlobal(pos))
+
+    def _assign_lod_to_selection(self, level: str):
+        for item in self.layer_tree.selectedItems():
+            combo = self.layer_tree.itemWidget(item, _LOD_COLUMN)
+            if combo is not None:
+                combo.setCurrentText(level)  # _on_lod_changed does the rest (node.lod + restyle)
+
+    # -- layer preview ------------------------------------------------------
+
+    def _show_preview_placeholder(self, text: str):
+        self.preview_label.clear()  # drop any pixmap so setText below actually shows
+        self.preview_label.setText(text)
+        self.preview_info_label.setText("")
+
+    def _on_selection_changed(self):
+        items = self.layer_tree.selectedItems()
+        if not items:
+            self._show_preview_placeholder("Select a layer\nto preview")
+            return
+
+        nodes = [item.data(0, _LAYER_NODE_ROLE) for item in items]
+        nodes = [node for node in nodes if node is not None and node.source is not None]
+        if not nodes:
+            self._show_preview_placeholder("No preview\navailable")
+            return
+
+        # Only a single selected node has a stable, reusable cache key -- any
+        # of the astronomically many possible multi-selections could be picked
+        # next, so caching those isn't worth the memory; a fresh composite
+        # for that case is still fast (same thread-pooled fast path).
+        cache_key = id(nodes[0]) if len(nodes) == 1 else None
+        self._render_preview(nodes, cache_key)
+
+    def _render_preview(self, nodes: list, cache_key):
+        if cache_key is not None:
+            cached = self._preview_cache.get(cache_key)
+            if cached is not None:
+                self.preview_label.setPixmap(cached)
+                self._set_preview_info(nodes)
+                return
+
+        # A group's own .composite() blends every descendant at full PSD
+        # resolution; layer_preview.render_group_thumbnail/render_nodes_thumbnail
+        # decode each leaf and shrink it immediately instead, which is what
+        # actually matters once the result only has to look right at ~180px
+        # (measured 13-16x faster on a real 41-layer production group -- see
+        # that module's docstring). A single leaf's own .composite() is
+        # already bbox-limited and fast, so it's untouched. Either way this
+        # still isn't instant on a big enough PSD, so the wait cursor matches
+        # this window's existing convention for anything that might take a
+        # beat (see _on_build_mesh/_on_rebuild_texture/_on_merge_textures).
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            if len(nodes) > 1:
+                image = render_nodes_thumbnail(nodes, max_size=256)
+            elif nodes[0].is_group:
+                image = render_group_thumbnail(nodes[0].source, max_size=256)
+            else:
+                image = nodes[0].source.composite()
+        except Exception:
+            traceback.print_exc()
+            self._show_preview_placeholder("Preview failed\n(see Script Editor)")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        if image is None or image.width == 0 or image.height == 0:
+            self._show_preview_placeholder("No preview\navailable")
+            return
+
+        pixmap = _pil_to_qpixmap(image)
+        scaled = pixmap.scaled(
+            _PREVIEW_SIZE, _PREVIEW_SIZE, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+        )
+
+        canvas = _checkerboard_pixmap(_PREVIEW_SIZE)
+        painter = QtGui.QPainter(canvas)
+        painter.drawPixmap((_PREVIEW_SIZE - scaled.width()) // 2, (_PREVIEW_SIZE - scaled.height()) // 2, scaled)
+        painter.end()
+
+        if cache_key is not None:
+            self._preview_cache[cache_key] = canvas
+        self.preview_label.setPixmap(canvas)
+        self._set_preview_info(nodes)
+
+    def _set_preview_info(self, nodes: list):
+        if len(nodes) == 1:
+            self.preview_info_label.setText(f"{nodes[0].width} x {nodes[0].height} px")
+        else:
+            self.preview_info_label.setText(f"{len(nodes)} layers selected")
 
     # -- build ------------------------------------------------------------
 
