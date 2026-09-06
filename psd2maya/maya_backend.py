@@ -25,6 +25,15 @@ usual remedy is `cmds.transferAttributes` from a saved copy of the source
 mesh (a world-space raycast projection, which introduces error and jagged
 UV borders wherever the new topology crosses a seam).
 
+The target face count `polyRetopo` aims for is looked up per mesh from
+`target_face_count_by_lod`, keyed by each `LayerMesh.lod` ("High"/"Mid"/
+"Low" -- see `ui.py`'s LOD column and `scene_model.SourceLayer.lod`) rather
+than one number applied uniformly to every layer. A background spanning
+the whole canvas and a small prop both used to get the same budget; now a
+layer explicitly tagged "Low" (a distant/unimportant piece) can collapse
+to a handful of faces while one tagged "High" keeps considerably more,
+independent of how big either happens to be on screen.
+
 This module doesn't need that. Each LayerMesh carries `uv_affine`, the
 closed-form `(u, v) = (a*x + b*y + c, d*x + e*y + f)` mapping from local
 position to atlas UV (exact because the mesh is planar and the pixel->atlas
@@ -66,6 +75,11 @@ from .scene_model import LayerMesh, SceneData
 logger = logging.getLogger(__name__)
 
 _UV_ATTRS = ("psdUvA", "psdUvB", "psdUvC", "psdUvD", "psdUvE", "psdUvF")
+
+# Matches ui.py's spin-counter defaults; used whenever a caller (e.g. the
+# mayapy CLI entry point, which has no per-layer UI to assign LOD from)
+# doesn't supply its own per-LOD budget.
+DEFAULT_TARGET_FACE_COUNT_BY_LOD = {"High": 25, "Mid": 15, "Low": 5}
 
 
 def _create_mesh_transform(mesh: LayerMesh):
@@ -210,10 +224,15 @@ def build_in_maya(
     atlas_texture_paths: Dict[int, str],
     root_name: str = "psd2maya_root",
     retopo: bool = False,
-    target_face_count: int = 200,
+    target_face_count_by_lod: Optional[Dict[str, int]] = None,
     retopo_failures: Optional[list] = None,
 ) -> str:
     """Build `scene` in the currently open Maya session. Returns the root transform's name.
+
+    When `retopo` is True, each mesh's polyRetopo target face count is
+    looked up from `target_face_count_by_lod` by its own `LayerMesh.lod`
+    ("High"/"Mid"/"Low"), falling back to `DEFAULT_TARGET_FACE_COUNT_BY_LOD`
+    for whichever keys aren't supplied (or the whole dict, if None).
 
     Pass a list as `retopo_failures` to find out which meshes fell back to
     their original traced topology. Worth checking: the fallback is also
@@ -222,6 +241,8 @@ def build_in_maya(
     """
     import maya.api.OpenMaya as om2  # noqa: PLC0415
     import maya.cmds as cmds  # noqa: PLC0415
+
+    face_counts_by_lod = {**DEFAULT_TARGET_FACE_COUNT_BY_LOD, **(target_face_count_by_lod or {})}
 
     root = cmds.group(empty=True, name=root_name)
 
@@ -258,6 +279,7 @@ def build_in_maya(
         _tag_uv_affine(mesh.maya_name, mesh.uv_affine)
 
         if retopo:
+            target_face_count = face_counts_by_lod.get(mesh.lod, face_counts_by_lod["Mid"])
             try:
                 retopologize(mesh.maya_name, target_face_count, uv_affine=mesh.uv_affine)
             except Exception:
@@ -285,7 +307,7 @@ def run_headless(
     psd_path: str,
     out_dir: str,
     retopo: bool = False,
-    target_face_count: int = 200,
+    target_face_count_by_lod: Optional[Dict[str, int]] = None,
     **pipeline_kwargs,
 ) -> str:
     """Convenience entry point for `mayapy -m psd2maya.maya_backend <psd> <out_dir>`.
@@ -305,7 +327,7 @@ def run_headless(
     from .pipeline import run_pipeline  # noqa: PLC0415 -- local import to avoid a cycle
 
     scene, atlas_paths = run_pipeline(psd_path, out_dir, **pipeline_kwargs)
-    build_in_maya(scene, atlas_paths, retopo=retopo, target_face_count=target_face_count)
+    build_in_maya(scene, atlas_paths, retopo=retopo, target_face_count_by_lod=target_face_count_by_lod)
 
     out_ma = os.path.join(out_dir, os.path.splitext(os.path.basename(psd_path))[0] + ".ma")
     cmds.file(rename=out_ma)

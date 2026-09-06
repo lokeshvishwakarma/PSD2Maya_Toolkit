@@ -205,6 +205,7 @@ def build_scene(
                     uvs=uvs,
                     faces=faces,
                     uv_affine=_uv_affine(layer, placement, page_w, page_h, pixels_per_unit),
+                    lod=layer.lod,
                 )
             )
 

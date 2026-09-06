@@ -22,6 +22,13 @@ class SourceLayer:
     bottom: int
     opacity: float  # 0..1
     pixels: object  # PIL.Image.Image (RGBA), cropped to (left, top, right, bottom)
+    # "High"/"Mid"/"Low", assigned per-layer in the UI's LOD column (ui.py) and
+    # threaded through by psd_reader.extract_layers' lod_by_name lookup; drives
+    # maya_backend.build_in_maya's per-mesh polyRetopo target face count when
+    # retopo=True. Defaults to "Mid" for anything not explicitly tagged (the
+    # CLI/mayapy entry points have no per-layer UI, so everything they build
+    # falls back to this).
+    lod: str = "Mid"
 
     @property
     def width(self) -> int:
@@ -86,6 +93,7 @@ class LayerMesh:
     # translated/scaled -- see maya_backend.reproject_uvs and
     # relayout.rebuild_textures_from_uv_layout.
     uv_affine: tuple = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # (a, b, c, d, e, f)
+    lod: str = "Mid"  # copied from the source SourceLayer.lod; see that field's docstring
 
 
 @dataclass

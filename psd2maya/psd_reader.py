@@ -21,7 +21,7 @@ node itself.
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from psd_tools import PSDImage
 
@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 def extract_layers(
     psd_path: str,
     include_hidden: bool = False,
+    lod_by_name: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[SourceLayer], int, int]:
     """Read `psd_path` and return (layers, canvas_width, canvas_height).
 
@@ -41,6 +42,13 @@ def extract_layers(
     non-empty bounding box, and (c) composite to at least one non-transparent
     pixel. Empty/fully-transparent layers are skipped with a debug log since
     they'd produce a degenerate, invisible plane in Maya.
+
+    `lod_by_name` maps a PSD layer's own name to a "High"/"Mid"/"Low" tag
+    (see `ui.py`'s LOD column); a layer not present in it -- including every
+    layer, when this is None -- gets `SourceLayer`'s own default ("Mid").
+    Keyed by plain name rather than any more precise identity, same caveat
+    as `relayout.py`'s `layers_by_name`: two layers sharing a name are
+    indistinguishable to this lookup and would get the same tag.
     """
     psd = PSDImage.open(psd_path)
     canvas_w, canvas_h = psd.width, psd.height
@@ -82,6 +90,7 @@ def extract_layers(
                 bottom=bbox[3],
                 opacity=opacity,
                 pixels=image,
+                lod=(lod_by_name or {}).get(layer.name, "Mid"),
             )
         )
         stack_index += 1

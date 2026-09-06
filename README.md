@@ -120,6 +120,26 @@ dataclasses are the only thing they share.
   checkbox off, if face count matters more than quad flow. If `polyRetopo`
   fails on a given shell it's logged and that mesh keeps its original
   traced topology rather than aborting the build.
+- **Target face count is per-LOD, not one number for every mesh.** The UI's
+  LOD column (`High`/`Mid`/`Low` per layer, via a combo box per tree row)
+  used to be purely cosmetic; it now drives `polyRetopo`'s budget.
+  `SourceLayer`/`LayerMesh` both carry `lod` (`psd_reader.extract_layers`'s
+  `lod_by_name` parameter tags each `SourceLayer` from a `{layer name: LOD}`
+  dict; `mesh_builder` copies it onto every shell built from that layer),
+  and three spinboxes under the polyRetopo checkbox (defaults High=25,
+  Mid=15, Low=5) map each tier to its own `targetFaceCount`, looked up per
+  mesh in `maya_backend.build_in_maya` by `LayerMesh.lod`. A background
+  spanning the whole canvas and a small prop used to get the same budget
+  regardless of either one's actual importance; now a layer explicitly
+  tagged "Low" can collapse to a handful of faces while one tagged "High"
+  keeps considerably more, independent of on-screen size. `ui.py`'s
+  `_collect_lod_by_name` reads the live tree (not a snapshot from load
+  time) when Build Mesh is clicked, so LOD edits made right up to that
+  point are picked up. Layers never explicitly tagged -- including
+  everything built via the mayapy CLI, which has no per-layer UI to tag
+  from -- default to "Mid". A group's own LOD combo is still inert: groups
+  never become their own mesh, so there's nothing for that tag to apply
+  to.
 - **One mesh per layer (or per shell), not one shared mesh.** Each
   traced shell becomes its own transform + mesh, parented under a common
   `psd2maya_root` group. This is what makes it a *parallax rig* rather
@@ -344,8 +364,11 @@ to the source file.
 Ticking **Use Maya polyRetopo** remeshes each layer with Maya's
 retopologizer instead of the built-in ear-clip topology and then restores
 exact UVs (see the design note above for the tradeoffs -- it's slower and
-usually *raises* face count). **Target faces per mesh** enables only when
-that box is ticked.
+usually *raises* face count). The three **Target faces per LOD**
+spinboxes (High/Mid/Low, defaulting to 25/15/5) enable only when that box
+is ticked, and each mesh's budget is looked up by whatever LOD you assigned
+it in the tree's LOD column -- right-click a multi-selection there to
+bulk-assign one.
 
 To re-derive UVs yourself after remeshing a layer by hand:
 
