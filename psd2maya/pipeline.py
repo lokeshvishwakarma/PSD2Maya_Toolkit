@@ -8,7 +8,7 @@ identically and only differ in how they materialize the result.
 from __future__ import annotations
 
 import os
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from .atlas_packer import pack_layers
 from .mesh_builder import build_scene
@@ -28,10 +28,11 @@ def run_pipeline(
     alpha_threshold: int = 10,
     min_contour_area: float = 50.0,
     atlas_basename: str = "atlas",
+    lod_by_name: Optional[Dict[str, str]] = None,
 ) -> Tuple[SceneData, Dict[int, str]]:
     os.makedirs(out_dir, exist_ok=True)
 
-    layers, canvas_w, canvas_h = extract_layers(psd_path, include_hidden=include_hidden)
+    layers, canvas_w, canvas_h = extract_layers(psd_path, include_hidden=include_hidden, lod_by_name=lod_by_name)
     atlas = pack_layers(layers, max_page_size=max_page_size, padding=padding)
     scene = build_scene(
         layers,

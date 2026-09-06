@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import traceback
+from typing import Dict
 
 import maya.cmds as cmds
 import maya.OpenMayaUI as omui
@@ -252,22 +253,31 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             "UVs are recomputed exactly afterward, so the texture is unaffected."
         )
 
-        self.target_face_count_spin = QtWidgets.QSpinBox(options_group)
-        self.target_face_count_spin.setRange(4, 100000)
-        self.target_face_count_spin.setSingleStep(50)
-        self.target_face_count_spin.setValue(200)
-        self.target_face_count_spin.setEnabled(False)
-        self.target_face_count_spin.setToolTip(
-            "Approximate quad count polyRetopo aims for, per mesh. Applied to every "
-            "layer alike, so large background layers get the same budget as small props."
-        )
+        # One target-face-count spinner per LOD tier rather than a single
+        # value applied to every mesh alike: a layer explicitly tagged "Low"
+        # in the tree's LOD column (see _attach_lod_combo) can collapse to a
+        # handful of faces while one tagged "High" keeps considerably more,
+        # independent of how big either happens to be on screen -- looked up
+        # per mesh by maya_backend.build_in_maya via each LayerMesh.lod.
+        self.lod_polycount_spins: Dict[str, QtWidgets.QSpinBox] = {}
+        lod_polycount_row = QtWidgets.QHBoxLayout()
+        for level, default_value in zip(_LOD_LEVELS, (25, 15, 5)):
+            spin = QtWidgets.QSpinBox(options_group)
+            spin.setRange(3, 100000)  # polyRetopo needs at least a triangle's worth of faces
+            spin.setSingleStep(5)
+            spin.setValue(default_value)
+            spin.setEnabled(False)
+            spin.setToolTip(f"Approximate quad count polyRetopo aims for on a '{level}' LOD mesh.")
+            self.lod_polycount_spins[level] = spin
+            lod_polycount_row.addWidget(QtWidgets.QLabel(f"{level}:", options_group))
+            lod_polycount_row.addWidget(spin)
 
         opt_form.addRow(self.include_hidden_chk)
         opt_form.addRow("Pixels per Maya unit:", self.pixels_per_unit_spin)
         opt_form.addRow("Depth step (Z per layer):", self.depth_step_spin)
         opt_form.addRow("Trace detail (lower = tighter):", self.detail_level_spin)
         opt_form.addRow(self.retopo_chk)
-        opt_form.addRow("Target faces per mesh:", self.target_face_count_spin)
+        opt_form.addRow("Target faces per LOD:", lod_polycount_row)
         layout.addWidget(options_group)
 
         self.status_label = QtWidgets.QLabel("", self)
@@ -299,7 +309,8 @@ class Psd2MayaWindow(QtWidgets.QDialog):
 
     def _connect_signals(self):
         self.browse_btn.clicked.connect(self._on_browse)
-        self.retopo_chk.toggled.connect(self.target_face_count_spin.setEnabled)
+        for spin in self.lod_polycount_spins.values():
+            self.retopo_chk.toggled.connect(spin.setEnabled)
         self.path_edit.fileDropped.connect(self._load_psd)
         self.path_edit.returnPressed.connect(lambda: self._load_psd(self.path_edit.text().strip()))
         self.build_btn.clicked.connect(self._on_build_mesh)
@@ -429,6 +440,25 @@ class Psd2MayaWindow(QtWidgets.QDialog):
             if combo is not None:
                 combo.setCurrentText(level)  # _on_lod_changed does the rest (node.lod + restyle)
 
+    def _collect_lod_by_name(self) -> Dict[str, str]:
+        """{layer name: LOD} for every non-group row, read fresh from the live tree.
+
+        Passed to `pipeline.run_pipeline` as `lod_by_name` so `psd_reader.
+        extract_layers` can tag each `SourceLayer` with whatever LOD the user
+        last set in the tree -- reading the tree directly (rather than some
+        snapshot taken at load time) means edits made right up until Build
+        Mesh is clicked are picked up. Groups are skipped: they never become
+        their own mesh, so a group's own LOD combo has nothing to apply to.
+        """
+        lod_by_name: Dict[str, str] = {}
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.layer_tree)
+        while iterator.value():
+            node = iterator.value().data(0, _LAYER_NODE_ROLE)
+            if node is not None and not node.is_group:
+                lod_by_name[node.name] = node.lod
+            iterator += 1
+        return lod_by_name
+
     # -- layer preview ------------------------------------------------------
 
     def _show_preview_placeholder(self, text: str):
@@ -537,13 +567,14 @@ class Psd2MayaWindow(QtWidgets.QDialog):
                 depth_step=self.depth_step_spin.value(),
                 detail_level=self.detail_level_spin.value(),
                 include_hidden=self.include_hidden_chk.isChecked(),
+                lod_by_name=self._collect_lod_by_name(),
             )
             retopo_failures = []
             root = build_in_maya(
                 scene,
                 atlas_paths,
                 retopo=self.retopo_chk.isChecked(),
-                target_face_count=self.target_face_count_spin.value(),
+                target_face_count_by_lod={level: spin.value() for level, spin in self.lod_polycount_spins.items()},
                 retopo_failures=retopo_failures,
             )
             cmds.select(root, replace=True)

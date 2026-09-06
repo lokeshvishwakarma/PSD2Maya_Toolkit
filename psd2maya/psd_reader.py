@@ -11,30 +11,17 @@ the bottom-most one in the Photoshop layers panel and the last is the
 topmost. `mesh_builder` relies on that to place background layers further
 from camera by default.
 
-Groups themselves are never returned as their own SourceLayer -- only
-rasterizable layers (pixel, text, shape, smart object, adjustment-with-pixels,
-...) are. A group's own visibility/opacity already gates its children in
-psd-tools' compositing, so we don't need to special-case folders here beyond
-recursing into them. Each returned layer does carry `group_path`, the chain
-of enclosing group names, so callers can still rebuild the folder structure
-(see mesh_builder._resolve_group_path) even though the groups themselves
-never become SourceLayers.
-
-`_iter_leaves` replaces what used to be a flat `psd.descendants()` loop with
-an equivalent recursive walk that additionally threads `group_path` down
-through each level. It's equivalent, not just similar: `descendants()` is
-itself `for layer in self: yield layer; if group: yield from layer.
-descendants()` -- a pre-order DFS that fully visits a group's subtree before
-moving to the next sibling -- which is exactly what recursing into a group
-immediately upon encountering it (below) also produces. So leaf order, and
-therefore `stack_index`/depth assignment, is unchanged from before this
-module tracked hierarchy at all.
+Groups themselves are transparent: only rasterizable layers (pixel, text,
+shape, smart object, adjustment-with-pixels, ...) are returned. A group's
+own visibility/opacity already gates its children in psd-tools' compositing,
+so we don't need to special-case folders here beyond skipping the group
+node itself.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Iterator, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from psd_tools import PSDImage
 
@@ -43,18 +30,10 @@ from .scene_model import SourceLayer
 logger = logging.getLogger(__name__)
 
 
-def _iter_leaves(container, group_path: Tuple[str, ...] = ()) -> Iterator[Tuple[object, Tuple[str, ...]]]:
-    """Yield (leaf_layer, group_path) for every non-group descendant, in file order."""
-    for layer in container:
-        if layer.is_group():
-            yield from _iter_leaves(layer, group_path + (layer.name or "Group",))
-        else:
-            yield layer, group_path
-
-
 def extract_layers(
     psd_path: str,
     include_hidden: bool = False,
+    lod_by_name: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[SourceLayer], int, int]:
     """Read `psd_path` and return (layers, canvas_width, canvas_height).
 
@@ -63,6 +42,13 @@ def extract_layers(
     non-empty bounding box, and (c) composite to at least one non-transparent
     pixel. Empty/fully-transparent layers are skipped with a debug log since
     they'd produce a degenerate, invisible plane in Maya.
+
+    `lod_by_name` maps a PSD layer's own name to a "High"/"Mid"/"Low" tag
+    (see `ui.py`'s LOD column); a layer not present in it -- including every
+    layer, when this is None -- gets `SourceLayer`'s own default ("Mid").
+    Keyed by plain name rather than any more precise identity, same caveat
+    as `relayout.py`'s `layers_by_name`: two layers sharing a name are
+    indistinguishable to this lookup and would get the same tag.
     """
     psd = PSDImage.open(psd_path)
     canvas_w, canvas_h = psd.width, psd.height
@@ -71,7 +57,9 @@ def extract_layers(
     stack_index = 0
     skipped = []
 
-    for layer, group_path in _iter_leaves(psd):
+    for layer in psd.descendants():
+        if layer.is_group():
+            continue
         if not include_hidden and not layer.visible:
             skipped.append((layer.name, "hidden"))
             continue
@@ -102,7 +90,7 @@ def extract_layers(
                 bottom=bbox[3],
                 opacity=opacity,
                 pixels=image,
-                group_path=group_path,
+                lod=(lod_by_name or {}).get(layer.name, "Mid"),
             )
         )
         stack_index += 1
